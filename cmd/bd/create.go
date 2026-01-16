@@ -335,6 +335,11 @@ var createCmd = &cobra.Command{
 		if cmd.Flags().Changed("repo") {
 			// Explicit --repo flag overrides auto-routing
 			repoPath = repoOverride
+		} else if os.Getenv("BEADS_DIR") != "" {
+			// BEADS_DIR environment variable overrides routing (used by gt mail)
+			// When set, the caller explicitly specifies which beads to use
+			debug.Logf("DEBUG: BEADS_DIR set, skipping routing\n")
+			repoPath = "."
 		} else {
 			// Auto-routing based on user role
 			userRole, err := routing.DetectUserRole(".")

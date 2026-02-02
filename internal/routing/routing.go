@@ -71,7 +71,7 @@ func detectFromURL(repoPath string) UserRole {
 	// Check if URL indicates write access
 	// Local filesystem paths indicate full access (it's your own machine)
 	if strings.HasPrefix(pushURL, "/") || strings.HasPrefix(pushURL, "file://") {
-		return Maintainer, nil
+		return Maintainer
 	}
 
 	// SSH URLs (git@github.com:user/repo.git) typically indicate write access

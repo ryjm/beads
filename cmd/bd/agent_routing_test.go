@@ -122,6 +122,81 @@ func TestAgentStateWithRouting(t *testing.T) {
 	t.Logf("Successfully resolved agent %s via routing", result.Issue.ID)
 }
 
+// TestResolveAndGetIssueWithRouting_ExplicitDBBypassesPrefixRouting verifies that
+// explicit --db disables cross-repo prefix routing.
+//
+// NOTE: This test uses os.Chdir and cannot run in parallel with other tests.
+func TestResolveAndGetIssueWithRouting_ExplicitDBBypassesPrefixRouting(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	townBeadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(townBeadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create town beads dir: %v", err)
+	}
+
+	rigBeadsDir := filepath.Join(tmpDir, "rig", ".beads")
+	if err := os.MkdirAll(rigBeadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create rig beads dir: %v", err)
+	}
+
+	townDBPath := filepath.Join(townBeadsDir, "beads.db")
+	townStore := newTestStoreWithPrefix(t, townDBPath, "og")
+
+	rigDBPath := filepath.Join(rigBeadsDir, "beads.db")
+	_ = newTestStoreWithPrefix(t, rigDBPath, "gt")
+
+	localIssue := &types.Issue{
+		ID:        "og-y4f",
+		Title:     "Local explicit-db issue",
+		IssueType: types.TypeTask,
+		Status:    types.StatusOpen,
+	}
+	if err := townStore.CreateIssue(ctx, localIssue, "test"); err != nil {
+		t.Fatalf("Failed to create local issue: %v", err)
+	}
+
+	routesPath := filepath.Join(townBeadsDir, "routes.jsonl")
+	routesContent := `{"prefix":"og-","path":"rig"}`
+	if err := os.WriteFile(routesPath, []byte(routesContent), 0644); err != nil {
+		t.Fatalf("Failed to write routes.jsonl: %v", err)
+	}
+
+	oldDbPath := dbPath
+	oldDbPathExplicit := dbPathExplicit
+	dbPath = townDBPath
+	dbPathExplicit = true
+	t.Cleanup(func() {
+		dbPath = oldDbPath
+		dbPathExplicit = oldDbPathExplicit
+	})
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Failed to get working directory: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("Failed to change to temp directory: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+
+	result, err := resolveAndGetIssueWithRouting(ctx, townStore, localIssue.ID)
+	if err != nil {
+		t.Fatalf("resolveAndGetIssueWithRouting failed: %v", err)
+	}
+	if result == nil || result.Issue == nil {
+		t.Fatal("resolveAndGetIssueWithRouting returned nil")
+	}
+	defer result.Close()
+
+	if result.Routed {
+		t.Fatal("expected explicit --db lookup to stay local, but result was routed")
+	}
+	if result.Issue.ID != localIssue.ID {
+		t.Fatalf("expected issue ID %q, got %q", localIssue.ID, result.Issue.ID)
+	}
+}
+
 // TestNeedsRoutingFunction tests the needsRouting function
 func TestNeedsRoutingFunction(t *testing.T) {
 	// Without dbPath set, needsRouting should return false

@@ -37,6 +37,18 @@ func (r *RoutedResult) Close() {
 	}
 }
 
+// prefixRoutingEnabled returns true when prefix-based cross-repo routing should be attempted.
+// Explicit --db and BEADS_DIR both mean "use exactly this database", so routing must be disabled.
+func prefixRoutingEnabled() bool {
+	if dbPath == "" || beadsDirOverride() {
+		return false
+	}
+	if dbPathExplicit {
+		return false
+	}
+	return true
+}
+
 // resolveAndGetIssueWithRouting resolves a partial ID and gets the issue,
 // using routes.jsonl for prefix-based routing if needed.
 // This enables cross-repo issue lookups (e.g., `bd show gt-xyz` from ~/gt).
@@ -46,13 +58,8 @@ func (r *RoutedResult) Close() {
 // The caller MUST call result.Close() when done to release any routed storage.
 func resolveAndGetIssueWithRouting(ctx context.Context, localStore storage.Storage, id string) (*RoutedResult, error) {
 	// Step 1: Check if routing is needed based on ID prefix
-	if dbPath == "" {
+	if !prefixRoutingEnabled() {
 		// No routing without a database path - use local store
-		return resolveAndGetFromStore(ctx, localStore, id, false)
-	}
-
-	// BEADS_DIR explicitly set — use local store, skip prefix routing (GH#663)
-	if beadsDirOverride() {
 		return resolveAndGetFromStore(ctx, localStore, id, false)
 	}
 
@@ -147,8 +154,8 @@ func getIssueWithRouting(ctx context.Context, localStore storage.Storage, id str
 	}
 
 	// Step 2: Check routes.jsonl for prefix-based routing
-	if dbPath == "" || beadsDirOverride() {
-		// No routing without a database path, or BEADS_DIR explicitly set (GH#663)
+	if !prefixRoutingEnabled() {
+		// No routing without a database path - return original result
 		return &RoutedResult{
 			Issue:      issue,
 			Store:      localStore,
@@ -197,7 +204,7 @@ func getIssueWithRouting(ctx context.Context, localStore storage.Storage, id str
 // Returns nil if no routing is needed (issue should be in local store).
 // The caller is responsible for closing the returned storage.
 func getRoutedStoreForID(ctx context.Context, id string) (*routing.RoutedStorage, error) {
-	if dbPath == "" || beadsDirOverride() {
+	if !prefixRoutingEnabled() {
 		return nil, nil
 	}
 
@@ -209,7 +216,7 @@ func getRoutedStoreForID(ctx context.Context, id string) (*routing.RoutedStorage
 // needsRouting checks if an ID would be routed to a different beads directory.
 // This is used to decide whether to bypass the daemon for cross-repo lookups.
 func needsRouting(id string) bool {
-	if dbPath == "" || beadsDirOverride() {
+	if !prefixRoutingEnabled() {
 		return false
 	}
 

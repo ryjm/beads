@@ -30,10 +30,11 @@ import (
 )
 
 var (
-	dbPath     string
-	actor      string
-	store      storage.Storage
-	jsonOutput bool
+	dbPath         string
+	dbPathExplicit bool // true when current command explicitly provided --db
+	actor          string
+	store          storage.Storage
+	jsonOutput     bool
 
 	// Signal-aware context for graceful cancellation
 	rootCtx    context.Context
@@ -329,9 +330,10 @@ var rootCmd = &cobra.Command{
 				WasSet bool
 			}{lockTimeout, true}
 		}
+		dbPathExplicit = cmd.Flags().Changed("db")
 		if !cmd.Flags().Changed("db") && dbPath == "" {
 			dbPath = config.GetString("db")
-		} else if cmd.Flags().Changed("db") {
+		} else if dbPathExplicit {
 			flagOverrides["db"] = struct {
 				Value  interface{}
 				WasSet bool

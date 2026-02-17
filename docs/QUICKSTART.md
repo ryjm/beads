@@ -43,7 +43,7 @@ Notes:
 - SQLite backend stores data in `.beads/beads.db`.
 - Dolt backend stores data in `.beads/dolt/` and records `"database": "dolt"` in `.beads/metadata.json`.
 - Dolt backend runs **single-process-only**; daemon mode is disabled.
-- Dolt backend **auto-commits** after each successful write command by default (`dolt.auto-commit: on`). Disable with `bd --dolt-auto-commit off ...` or config.
+- Dolt backend **auto-commits** after each successful write command in embedded mode (`dolt.auto-commit: on`). In server mode, auto-commit defaults to OFF. Override with `bd --dolt-auto-commit off|on ...` or config.
 
 ### Role Configuration
 
@@ -244,28 +244,6 @@ bd admin cleanup --force
 - Before archiving a project phase
 
 **Note:** Compaction is permanent graceful decay. Original content is discarded but viewable via `bd restore <id>` from git history.
-
-## Background Daemon
-
-bd runs a background daemon for auto-sync and performance. You rarely need to manage it directly:
-
-```bash
-# Check daemon status
-bd info | grep daemon
-
-# List all running daemons
-bd daemons list
-
-# Force direct mode (skip daemon)
-bd --no-daemon ready
-```
-
-**When to disable daemon:**
-- Git worktrees (required: `bd --no-daemon`)
-- CI/CD pipelines
-- Resource-constrained environments
-
-See [DAEMON.md](DAEMON.md) for complete daemon management guide.
 
 ## Next Steps
 

@@ -11,6 +11,7 @@ import (
 	"github.com/steveyegge/beads/cmd/bd/doctor/fix"
 	"github.com/steveyegge/beads/internal/syncbranch"
 	"github.com/steveyegge/beads/internal/ui"
+	"golang.org/x/term"
 )
 
 // previewFixes shows what would be fixed without applying changes
@@ -77,8 +78,17 @@ func applyFixes(result doctorResult) {
 		return
 	}
 
-	// Ask for confirmation (skip if --yes flag is set)
+	// Ask for confirmation (skip if --yes flag is set or stdin is non-interactive)
 	if !doctorYes {
+		// Detect non-interactive stdin (e.g., piped input in CI/automation)
+		isInteractive := term.IsTerminal(int(os.Stdin.Fd()))
+		if !isInteractive {
+			// In non-interactive mode without --yes, skip with helpful message
+			fmt.Fprintf(os.Stderr, "\n%s Running in non-interactive mode\n", ui.RenderWarn("⚠"))
+			fmt.Fprintf(os.Stderr, "  To auto-fix issues without prompting, use: %s\n\n", ui.RenderAccent("bd doctor --fix --yes"))
+			return
+		}
+
 		fmt.Printf("\nThis will attempt to fix %d issue(s). Continue? (Y/n): ", len(fixableIssues))
 		reader := bufio.NewReader(os.Stdin)
 		response, err := reader.ReadString('\n')
@@ -101,6 +111,14 @@ func applyFixes(result doctorResult) {
 
 // applyFixesInteractive prompts for each fix individually
 func applyFixesInteractive(path string, issues []doctorCheck) {
+	// Detect non-interactive stdin before attempting to prompt
+	isInteractive := term.IsTerminal(int(os.Stdin.Fd()))
+	if !isInteractive {
+		fmt.Fprintf(os.Stderr, "\n%s Interactive mode requires a terminal\n", ui.RenderWarn("⚠"))
+		fmt.Fprintf(os.Stderr, "  Use 'bd doctor --fix --yes' for non-interactive mode\n\n")
+		return
+	}
+
 	reader := bufio.NewReader(os.Stdin)
 	applyAll := false
 	var approvedFixes []doctorCheck
@@ -138,6 +156,10 @@ func applyFixesInteractive(path string, issues []doctorCheck) {
 		response, err := reader.ReadString('\n')
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
+			if len(approvedFixes) > 0 {
+				fmt.Printf("\nApplying %d previously approved fix(es) before exit...\n", len(approvedFixes))
+				applyFixList(path, approvedFixes)
+			}
 			return
 		}
 
@@ -181,7 +203,7 @@ func applyFixesInteractive(path string, issues []doctorCheck) {
 func applyFixList(path string, fixes []doctorCheck) {
 	// Apply fixes in a dependency-aware order.
 	// Rough dependency chain:
-	// permissions/daemon cleanup → config sanity → DB integrity/migrations → DB↔JSONL sync.
+	// permissions/lock cleanup → config sanity → DB integrity/migrations → DB↔JSONL sync.
 	order := []string{
 		"Lock Files",
 		"Permissions",
@@ -192,7 +214,6 @@ func applyFixList(path string, fixes []doctorCheck) {
 		"Database",
 		"Schema Compatibility",
 		"JSONL Integrity",
-		"DB-JSONL Sync",
 		"Sync Divergence",
 	}
 	priority := make(map[string]int, len(order))
@@ -233,16 +254,16 @@ func applyFixList(path string, fixes []doctorCheck) {
 			err = doctor.FixLastTouchedTracking()
 		case "Git Hooks":
 			err = fix.GitHooks(path)
-		case "Daemon Health":
-			err = fix.Daemon(path)
-		case "DB-JSONL Sync":
-			err = fix.DBJSONLSync(path)
 		case "Sync Divergence":
 			err = fix.SyncDivergence(path)
 		case "Permissions":
 			err = fix.Permissions(path)
 		case "Database":
 			err = fix.DatabaseVersion(path)
+			// Also repair any other missing metadata fields (bd_version, repo_id, clone_id)
+			if mErr := fix.FixMissingMetadata(path, Version); mErr != nil && err == nil {
+				err = mErr
+			}
 		case "Database Integrity":
 			// Corruption detected - try recovery from JSONL
 			// Pass force and source flags for enhanced recovery
@@ -250,7 +271,11 @@ func applyFixList(path string, fixes []doctorCheck) {
 		case "Schema Compatibility":
 			err = fix.SchemaCompatibility(path)
 		case "Repo Fingerprint":
-			err = fix.RepoFingerprint(path)
+			err = fix.RepoFingerprint(path, doctorYes)
+			// Also repair any other missing metadata fields (bd_version, repo_id, clone_id)
+			if mErr := fix.FixMissingMetadata(path, Version); mErr != nil && err == nil {
+				err = mErr
+			}
 		case "Git Merge Driver":
 			err = fix.MergeDriver(path)
 		case "Sync Branch Config":
@@ -265,8 +290,6 @@ func applyFixList(path string, fixes []doctorCheck) {
 			err = fix.LegacyJSONLConfig(path)
 		case "JSONL Integrity":
 			err = fix.JSONLIntegrity(path)
-		case "Deletions Manifest":
-			err = fix.MigrateTombstones(path)
 		case "Untracked Files":
 			err = fix.UntrackedJSONL(path)
 		case "Sync Branch Health":
@@ -303,9 +326,6 @@ func applyFixList(path string, fixes []doctorCheck) {
 		case "Stale Closed Issues":
 			// consolidate cleanup into doctor --fix
 			err = fix.StaleClosedIssues(path)
-		case "Expired Tombstones":
-			// consolidate cleanup into doctor --fix
-			err = fix.ExpiredTombstones(path)
 		case "Compaction Candidates":
 			// No auto-fix: compaction requires agent review
 			fmt.Printf("  ⚠ Run 'bd compact --analyze' to review candidates\n")
@@ -320,6 +340,8 @@ func applyFixList(path string, fixes []doctorCheck) {
 			err = fix.PatrolPollution(path)
 		case "Lock Files":
 			err = fix.StaleLockFiles(path)
+		case "Classic Artifacts":
+			err = fix.ClassicArtifacts(path)
 		default:
 			fmt.Printf("  ⚠ No automatic fix available for %s\n", check.Name)
 			fmt.Printf("  Manual fix: %s\n", check.Fix)

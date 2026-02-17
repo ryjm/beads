@@ -12,11 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/steveyegge/beads/internal/audit"
 	"github.com/steveyegge/beads/internal/lockfile"
-	"github.com/steveyegge/beads/internal/routing"
 	"github.com/steveyegge/beads/internal/types"
-	"github.com/steveyegge/beads/internal/utils"
 )
 
 // BootstrapResult contains statistics about the bootstrap operation
@@ -36,11 +33,43 @@ type ParseError struct {
 	Snippet string
 }
 
+// BootstrapRoute holds route data for bootstrap import.
+// This is a local type to avoid importing internal/routing (which imports dolt, causing a cycle).
+type BootstrapRoute struct {
+	Prefix string
+	Path   string
+}
+
+// bootstrapInteractionEntry is a local type for deserializing interactions.jsonl entries.
+// Avoids importing internal/audit (which imports internal/beads → dolt, causing a cycle).
+type bootstrapInteractionEntry struct {
+	ID        string         `json:"id"`
+	Kind      string         `json:"kind"`
+	CreatedAt time.Time      `json:"created_at"`
+	Actor     string         `json:"actor,omitempty"`
+	IssueID   string         `json:"issue_id,omitempty"`
+	Model     string         `json:"model,omitempty"`
+	Prompt    string         `json:"prompt,omitempty"`
+	Response  string         `json:"response,omitempty"`
+	Error     string         `json:"error,omitempty"`
+	ToolName  string         `json:"tool_name,omitempty"`
+	ExitCode  *int           `json:"exit_code,omitempty"`
+	ParentID  string         `json:"parent_id,omitempty"`
+	Label     string         `json:"label,omitempty"`
+	Reason    string         `json:"reason,omitempty"`
+	Extra     map[string]any `json:"extra,omitempty"`
+}
+
 // BootstrapConfig controls bootstrap behavior
 type BootstrapConfig struct {
 	BeadsDir    string        // Path to .beads directory
 	DoltPath    string        // Path to dolt subdirectory
 	LockTimeout time.Duration // Timeout waiting for bootstrap lock
+	Database    string        // Database name (e.g. "beads_hq"); defaults to "beads"
+
+	// Routes to import during bootstrap (loaded by caller from routes.jsonl).
+	// If nil, route import is skipped.
+	Routes []BootstrapRoute
 }
 
 // Bootstrap checks if Dolt DB needs bootstrapping from JSONL and performs it if needed.
@@ -57,7 +86,7 @@ func Bootstrap(ctx context.Context, cfg BootstrapConfig) (bool, *BootstrapResult
 	}
 
 	// Check if Dolt database already exists and is ready
-	if doltExists(cfg.DoltPath) && schemaReady(ctx, cfg.DoltPath) {
+	if doltExists(cfg.DoltPath) && schemaReady(ctx, cfg.DoltPath, cfg.Database) {
 		return false, nil, nil
 	}
 
@@ -77,7 +106,7 @@ func Bootstrap(ctx context.Context, cfg BootstrapConfig) (bool, *BootstrapResult
 	defer releaseBootstrapLock(lockFile, lockPath)
 
 	// Double-check after acquiring lock - another process may have bootstrapped
-	if doltExists(cfg.DoltPath) && schemaReady(ctx, cfg.DoltPath) {
+	if doltExists(cfg.DoltPath) && schemaReady(ctx, cfg.DoltPath, cfg.Database) {
 		return false, nil, nil
 	}
 
@@ -120,11 +149,14 @@ func doltExists(doltPath string) bool {
 // schemaReady checks if the Dolt database has the required schema
 // This is a simple check based on the existence of expected files.
 // We avoid opening a connection here since the caller will do that.
-func schemaReady(_ context.Context, doltPath string) bool {
+func schemaReady(_ context.Context, doltPath string, dbName string) bool {
+	if dbName == "" {
+		dbName = "beads"
+	}
 	// The embedded Dolt driver stores databases in subdirectories.
 	// Check for the expected database name's config.json which indicates
 	// the database was initialized.
-	configPath := filepath.Join(doltPath, "beads", ".dolt", "config.json")
+	configPath := filepath.Join(doltPath, dbName, ".dolt", "config.json")
 	_, err := os.Stat(configPath)
 	return err == nil
 }
@@ -161,7 +193,7 @@ func acquireBootstrapLock(lockPath string, timeout time.Duration) (*os.File, err
 		age := time.Since(info.ModTime())
 		if age > staleLockAge {
 			fmt.Fprintf(os.Stderr, "Bootstrap: removing stale lock file (age: %s)\n", age.Round(time.Second))
-			_ = os.Remove(lockPath)
+			_ = os.Remove(lockPath) // Best effort cleanup of lock file
 		}
 	}
 
@@ -185,12 +217,12 @@ func acquireBootstrapLock(lockPath string, timeout time.Duration) (*os.File, err
 
 		if !lockfile.IsLocked(err) {
 			// Unexpected error (not contention)
-			_ = f.Close()
+			_ = f.Close() // Best effort cleanup on error path
 			return nil, fmt.Errorf("failed to acquire bootstrap lock: %w", err)
 		}
 
 		if time.Now().After(deadline) {
-			_ = f.Close()
+			_ = f.Close() // Best effort cleanup on error path
 			return nil, fmt.Errorf("timeout after %s waiting for bootstrap lock (another bootstrap may be running)", timeout)
 		}
 
@@ -202,11 +234,11 @@ func acquireBootstrapLock(lockPath string, timeout time.Duration) (*os.File, err
 // releaseBootstrapLock releases the bootstrap lock and removes the lock file
 func releaseBootstrapLock(f *os.File, lockPath string) {
 	if f != nil {
-		_ = lockfile.FlockUnlock(f)
-		_ = f.Close()
+		_ = lockfile.FlockUnlock(f) // Best effort: unlock may fail if fd is bad
+		_ = f.Close()               // Best effort cleanup
 	}
 	// Clean up lock file
-	_ = os.Remove(lockPath)
+	_ = os.Remove(lockPath) // Best effort cleanup of lock file
 }
 
 // performBootstrap performs the actual bootstrap from JSONL files.
@@ -245,7 +277,7 @@ func performBootstrap(ctx context.Context, cfg BootstrapConfig, jsonlPath string
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Dolt store: %w", err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = store.Close() }() // Best effort cleanup
 
 	// Set issue prefix
 	if result.PrefixDetected != "" {
@@ -255,9 +287,9 @@ func performBootstrap(ctx context.Context, cfg BootstrapConfig, jsonlPath string
 	}
 
 	// Import routes first (no dependencies)
-	routesImported, err := importRoutesBootstrap(ctx, store, cfg.BeadsDir)
+	routesImported, err := importRoutesBootstrap(ctx, store, cfg.Routes)
 	if err != nil {
-		// Non-fatal - routes.jsonl may not exist
+		// Non-fatal - routes may not exist
 		fmt.Fprintf(os.Stderr, "Bootstrap: warning: failed to import routes: %v\n", err)
 	}
 	result.RoutesImported = routesImported
@@ -296,7 +328,7 @@ func parseJSONLWithErrors(jsonlPath string) ([]*types.Issue, []ParseError) {
 	if err != nil {
 		return nil, []ParseError{{Line: 0, Message: fmt.Sprintf("failed to open file: %v", err)}}
 	}
-	defer func() { _ = f.Close() }()
+	defer func() { _ = f.Close() }() // Best effort cleanup
 
 	var issues []*types.Issue
 	var parseErrors []ParseError
@@ -320,7 +352,7 @@ func parseJSONLWithErrors(jsonlPath string) ([]*types.Issue, []ParseError) {
 			parseErrors = append(parseErrors, ParseError{
 				Line:    lineNo,
 				Message: "Git merge conflict marker",
-				Snippet: truncateSnippet(line, 50),
+				Snippet: truncateSnippet(line),
 			})
 			continue
 		}
@@ -330,7 +362,7 @@ func parseJSONLWithErrors(jsonlPath string) ([]*types.Issue, []ParseError) {
 			parseErrors = append(parseErrors, ParseError{
 				Line:    lineNo,
 				Message: err.Error(),
-				Snippet: truncateSnippet(line, 50),
+				Snippet: truncateSnippet(line),
 			})
 			continue
 		}
@@ -338,10 +370,35 @@ func parseJSONLWithErrors(jsonlPath string) ([]*types.Issue, []ParseError) {
 		// Apply defaults for omitted fields
 		issue.SetDefaults()
 
+		// Validate ID is present (corruption check)
+		if issue.ID == "" {
+			parseErrors = append(parseErrors, ParseError{
+				Line:    lineNo,
+				Message: "issue has empty ID",
+				Snippet: truncateSnippet(line),
+			})
+			continue
+		}
+
+		// Validate status enum (catches corruption like 'opne' for 'open')
+		if !issue.Status.IsValid() {
+			parseErrors = append(parseErrors, ParseError{
+				Line:    lineNo,
+				Message: fmt.Sprintf("invalid status %q for issue %s", issue.Status, issue.ID),
+				Snippet: truncateSnippet(line),
+			})
+			continue
+		}
+
 		// Fix closed_at invariant
 		if issue.Status == types.StatusClosed && issue.ClosedAt == nil {
 			now := time.Now()
 			issue.ClosedAt = &now
+		}
+
+		// Fix non-closed issue with closed_at set (corruption recovery)
+		if issue.Status != types.StatusClosed && issue.ClosedAt != nil {
+			issue.ClosedAt = nil
 		}
 
 		issues = append(issues, &issue)
@@ -357,15 +414,16 @@ func parseJSONLWithErrors(jsonlPath string) ([]*types.Issue, []ParseError) {
 	return issues, parseErrors
 }
 
-// truncateSnippet truncates a string for display
-func truncateSnippet(s string, maxLen int) string {
-	if len(s) > maxLen {
-		return s[:maxLen] + "..."
+// truncateSnippet truncates a string for display (max 50 chars)
+func truncateSnippet(s string) string {
+	if len(s) > 50 {
+		return s[:50] + "..."
 	}
 	return s
 }
 
-// detectPrefixFromIssues detects the most common prefix from issues
+// detectPrefixFromIssues detects the most common prefix from issues.
+// Uses a simple first-hyphen extraction to avoid importing internal/utils (cycle).
 func detectPrefixFromIssues(issues []*types.Issue) string {
 	prefixCounts := make(map[string]int)
 
@@ -373,9 +431,11 @@ func detectPrefixFromIssues(issues []*types.Issue) string {
 		if issue.ID == "" {
 			continue
 		}
-		prefix := utils.ExtractIssuePrefix(issue.ID)
-		if prefix != "" {
-			prefixCounts[prefix]++
+		// Simple prefix extraction: take everything before the first hyphen.
+		// For bootstrap purposes this is sufficient (e.g., "bd-abc" → "bd").
+		idx := strings.Index(issue.ID, "-")
+		if idx > 0 {
+			prefixCounts[issue.ID[:idx]]++
 		}
 	}
 
@@ -395,18 +455,19 @@ func detectPrefixFromIssues(issues []*types.Issue) string {
 // importIssuesBootstrap imports issues during bootstrap
 // Returns (imported, skipped, error)
 func importIssuesBootstrap(ctx context.Context, store *DoltStore, issues []*types.Issue) (int, int, error) {
-	// Skip validation during bootstrap since we're importing existing data
-	// The data was already validated when originally created
+	// Issues are validated during parsing (parseJSONLWithErrors).
+	// This function handles cross-issue uniqueness checks.
 
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() { _ = tx.Rollback() }() // No-op after successful commit
 
 	imported := 0
 	skipped := 0
 	seenIDs := make(map[string]bool)
+	seenExternalRefs := make(map[string]bool)
 
 	for _, issue := range issues {
 		// Skip duplicates within batch
@@ -414,7 +475,19 @@ func importIssuesBootstrap(ctx context.Context, store *DoltStore, issues []*type
 			skipped++
 			continue
 		}
+
 		seenIDs[issue.ID] = true
+
+		// Skip duplicate external_ref values (corruption protection)
+		if issue.ExternalRef != nil && *issue.ExternalRef != "" {
+			if seenExternalRefs[*issue.ExternalRef] {
+				fmt.Fprintf(os.Stderr, "Bootstrap: warning: skipping issue %s with duplicate external_ref %s\n",
+					issue.ID, *issue.ExternalRef)
+				skipped++
+				continue
+			}
+			seenExternalRefs[*issue.ExternalRef] = true
+		}
 
 		// Set timestamps if missing
 		now := time.Now().UTC()
@@ -486,13 +559,9 @@ func importIssuesBootstrap(ctx context.Context, store *DoltStore, issues []*type
 	return imported, skipped, nil
 }
 
-// importRoutesBootstrap imports routes from routes.jsonl during bootstrap
-// Returns the number of routes imported
-func importRoutesBootstrap(ctx context.Context, store *DoltStore, beadsDir string) (int, error) {
-	routes, err := routing.LoadRoutes(beadsDir)
-	if err != nil {
-		return 0, err
-	}
+// importRoutesBootstrap imports routes during bootstrap.
+// Routes are passed via BootstrapConfig to avoid importing internal/routing (cycle).
+func importRoutesBootstrap(ctx context.Context, store *DoltStore, routes []BootstrapRoute) (int, error) {
 	if len(routes) == 0 {
 		return 0, nil // No routes to import
 	}
@@ -501,7 +570,7 @@ func importRoutesBootstrap(ctx context.Context, store *DoltStore, beadsDir strin
 	if err != nil {
 		return 0, fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() { _ = tx.Rollback() }() // No-op after successful commit
 
 	imported := 0
 	for _, route := range routes {
@@ -534,13 +603,13 @@ func importInteractionsBootstrap(ctx context.Context, store *DoltStore, interact
 		}
 		return 0, err
 	}
-	defer func() { _ = f.Close() }()
+	defer func() { _ = f.Close() }() // Best effort cleanup
 
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() { _ = tx.Rollback() }() // No-op after successful commit
 
 	imported := 0
 	scanner := bufio.NewScanner(f)
@@ -552,7 +621,7 @@ func importInteractionsBootstrap(ctx context.Context, store *DoltStore, interact
 			continue
 		}
 
-		var entry audit.Entry
+		var entry bootstrapInteractionEntry
 		if err := json.Unmarshal([]byte(line), &entry); err != nil {
 			// Skip malformed lines during bootstrap
 			continue
@@ -561,7 +630,7 @@ func importInteractionsBootstrap(ctx context.Context, store *DoltStore, interact
 		// Convert extra map to JSON (default to empty object for valid JSON)
 		extraJSON := []byte("{}")
 		if entry.Extra != nil {
-			extraJSON, _ = json.Marshal(entry.Extra)
+			extraJSON, _ = json.Marshal(entry.Extra) // json.Marshal on map types does not fail in practice
 		}
 
 		_, err := tx.ExecContext(ctx, `

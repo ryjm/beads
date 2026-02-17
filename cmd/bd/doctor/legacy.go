@@ -72,6 +72,76 @@ func CheckLegacyBeadsSlashCommands(repoPath string) DoctorCheck {
 	}
 }
 
+// CheckLegacyMCPToolReferences detects direct MCP tool name references in documentation
+// (e.g., mcp__beads_beads__list, mcp__plugin_beads_beads__show) and recommends
+// migration to bd prime hooks for better token efficiency.
+//
+// Old pattern: Document MCP tool names for direct tool calls (~10.5k tokens per scan)
+// New pattern: bd prime hooks with CLI commands (~50-2k tokens)
+func CheckLegacyMCPToolReferences(repoPath string) DoctorCheck {
+	docFiles := []string{
+		filepath.Join(repoPath, "AGENTS.md"),
+		filepath.Join(repoPath, "CLAUDE.md"),
+		filepath.Join(repoPath, ".claude", "CLAUDE.md"),
+		// Local-only variants (not committed to repo)
+		filepath.Join(repoPath, "claude.local.md"),
+		filepath.Join(repoPath, ".claude", "claude.local.md"),
+	}
+
+	mcpPatterns := []string{
+		"mcp__beads_beads__",
+		"mcp__plugin_beads_beads__",
+		"mcp_beads_",
+	}
+
+	var filesWithMCPRefs []string
+	for _, docFile := range docFiles {
+		content, err := os.ReadFile(docFile) // #nosec G304 - controlled paths from repoPath
+		if err != nil {
+			continue
+		}
+
+		contentStr := string(content)
+		for _, pattern := range mcpPatterns {
+			if strings.Contains(contentStr, pattern) {
+				filesWithMCPRefs = append(filesWithMCPRefs, filepath.Base(docFile))
+				break
+			}
+		}
+	}
+
+	if len(filesWithMCPRefs) == 0 {
+		return DoctorCheck{
+			Name:    "MCP Tool References",
+			Status:  "ok",
+			Message: "No MCP tool references in documentation",
+		}
+	}
+
+	return DoctorCheck{
+		Name:    "MCP Tool References",
+		Status:  "warning",
+		Message: fmt.Sprintf("MCP tool references found in %s", strings.Join(filesWithMCPRefs, ", ")),
+		Detail: "Found: Direct MCP tool name references (e.g., mcp__beads_beads__list)\n" +
+			"  MCP tool calls consume ~10.5k tokens per session for tool scanning",
+		Fix: "Migrate to bd prime hooks for better token efficiency:\n" +
+			"\n" +
+			"Migration Steps:\n" +
+			"  1. Run 'bd setup claude' to add SessionStart/PreCompact hooks\n" +
+			"  2. Replace MCP tool references with CLI commands:\n" +
+			"     - mcp__beads_beads__list  → bd list\n" +
+			"     - mcp__beads_beads__show  → bd show <id>\n" +
+			"     - mcp__beads_beads__ready → bd ready\n" +
+			"  3. bd prime hooks auto-inject context on session start\n" +
+			"\n" +
+			"Benefits:\n" +
+			"  • bd prime + hooks: ~50-2k tokens vs ~10.5k for MCP tool scan\n" +
+			"  • Automatic context recovery on session start and compaction\n" +
+			"\n" +
+			"See: bd setup claude --help",
+	}
+}
+
 // CheckAgentDocumentation checks if agent documentation (AGENTS.md or CLAUDE.md) exists
 // and recommends adding it if missing, suggesting bd onboard or bd setup claude.
 // Also supports local-only variants (claude.local.md) that are gitignored.
@@ -119,154 +189,6 @@ func CheckAgentDocumentation(repoPath string) DoctorCheck {
 	}
 }
 
-// CheckLegacyJSONLFilename detects if there are multiple JSONL files,
-// which can cause sync/merge issues. Ignores merge artifacts and backups.
-// When gastownMode is true, routes.jsonl is treated as a valid system file.
-func CheckLegacyJSONLFilename(repoPath string, gastownMode bool) DoctorCheck {
-	beadsDir := filepath.Join(repoPath, ".beads")
-
-	// Find all .jsonl files
-	entries, err := os.ReadDir(beadsDir)
-	if err != nil {
-		return DoctorCheck{
-			Name:    "JSONL Files",
-			Status:  "ok",
-			Message: "No .beads directory found",
-		}
-	}
-
-	var realJSONLFiles []string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-
-		// Must end with .jsonl
-		if !strings.HasSuffix(name, ".jsonl") {
-			continue
-		}
-
-		// Skip merge artifacts, backups, and system files
-		lowerName := strings.ToLower(name)
-		if strings.Contains(lowerName, "backup") ||
-			strings.Contains(lowerName, ".orig") ||
-			strings.Contains(lowerName, ".bak") ||
-			strings.Contains(lowerName, "~") ||
-			strings.HasPrefix(lowerName, "backup_") ||
-			name == "deletions.jsonl" ||
-			name == "interactions.jsonl" ||
-			name == "molecules.jsonl" ||
-			name == "sync_base.jsonl" ||
-			// Git merge conflict artifacts (e.g., issues.base.jsonl, issues.left.jsonl)
-			strings.Contains(lowerName, ".base.jsonl") ||
-			strings.Contains(lowerName, ".left.jsonl") ||
-			strings.Contains(lowerName, ".right.jsonl") ||
-			// Skip routes.jsonl in gastown mode (valid system file)
-			(gastownMode && name == "routes.jsonl") {
-			continue
-		}
-
-		realJSONLFiles = append(realJSONLFiles, name)
-	}
-
-	if len(realJSONLFiles) == 0 {
-		return DoctorCheck{
-			Name:    "JSONL Files",
-			Status:  "ok",
-			Message: "No JSONL files found (database-only mode)",
-		}
-	}
-
-	if len(realJSONLFiles) == 1 {
-		return DoctorCheck{
-			Name:    "JSONL Files",
-			Status:  "ok",
-			Message: fmt.Sprintf("Using %s", realJSONLFiles[0]),
-		}
-	}
-
-	// Multiple JSONL files found - this is a problem!
-	return DoctorCheck{
-		Name:    "JSONL Files",
-		Status:  "warning",
-		Message: fmt.Sprintf("Multiple JSONL files found: %s", strings.Join(realJSONLFiles, ", ")),
-		Detail: "Having multiple JSONL files can cause sync and merge conflicts.\n" +
-			"  Only one JSONL file should be used per repository.",
-		Fix: "Determine which file is current and remove the others:\n" +
-			"  1. Check .beads/metadata.json for 'jsonl_export' setting\n" +
-			"  2. Verify with 'git log .beads/*.jsonl' to see commit history\n" +
-			"  3. Remove the unused file(s): git rm .beads/<unused>.jsonl\n" +
-			"  4. Commit the change",
-	}
-}
-
-// CheckLegacyJSONLConfig detects if metadata.json is configured to use the legacy
-// beads.jsonl filename and recommends migrating to the canonical issues.jsonl.
-func CheckLegacyJSONLConfig(repoPath string) DoctorCheck {
-	beadsDir := filepath.Join(repoPath, ".beads")
-
-	// Load config
-	cfg, err := configfile.Load(beadsDir)
-	if err != nil || cfg == nil {
-		// No config - using defaults, which are now issues.jsonl
-		return DoctorCheck{
-			Name:    "JSONL Config",
-			Status:  "ok",
-			Message: "Using default configuration (issues.jsonl)",
-		}
-	}
-
-	// Check if using legacy beads.jsonl
-	if cfg.JSONLExport == "beads.jsonl" {
-		// Check if beads.jsonl actually exists
-		legacyPath := filepath.Join(beadsDir, "beads.jsonl")
-		canonicalPath := filepath.Join(beadsDir, "issues.jsonl")
-
-		legacyExists := false
-		if _, err := os.Stat(legacyPath); err == nil {
-			legacyExists = true
-		}
-
-		canonicalExists := false
-		if _, err := os.Stat(canonicalPath); err == nil {
-			canonicalExists = true
-		}
-
-		if legacyExists && !canonicalExists {
-			return DoctorCheck{
-				Name:    "JSONL Config",
-				Status:  "warning",
-				Message: "Using legacy beads.jsonl filename",
-				Detail: "The canonical filename is now issues.jsonl.\n" +
-					"  Legacy beads.jsonl is still supported but should be migrated.",
-				Fix: "Run 'bd doctor --fix' to auto-migrate, or manually:\n" +
-					"  1. git mv .beads/beads.jsonl .beads/issues.jsonl\n" +
-					"  2. Update metadata.json: jsonl_export: \"issues.jsonl\"\n" +
-					"  3. Update .gitattributes if present",
-			}
-		}
-
-		if !legacyExists && canonicalExists {
-			// Config says beads.jsonl but issues.jsonl exists - just update config
-			return DoctorCheck{
-				Name:    "JSONL Config",
-				Status:  "warning",
-				Message: "Config references beads.jsonl but issues.jsonl exists",
-				Detail:  "metadata.json says beads.jsonl but the actual file is issues.jsonl",
-				Fix:     "Run 'bd doctor --fix' to update the configuration",
-			}
-		}
-	}
-
-	// Using issues.jsonl or custom name - all good
-	return DoctorCheck{
-		Name:    "JSONL Config",
-		Status:  "ok",
-		Message: fmt.Sprintf("Using %s", cfg.JSONLExport),
-	}
-}
-
 // CheckDatabaseConfig verifies that the configured database and JSONL paths
 // match what actually exists on disk.
 func CheckDatabaseConfig(repoPath string) DoctorCheck {
@@ -283,6 +205,15 @@ func CheckDatabaseConfig(repoPath string) DoctorCheck {
 		}
 	}
 
+	// Dolt backend stores data on the server — no local .db or .jsonl files expected
+	if cfg.GetBackend() == configfile.BackendDolt {
+		return DoctorCheck{
+			Name:    "Database Config",
+			Status:  "ok",
+			Message: "Dolt backend (data on server)",
+		}
+	}
+
 	var issues []string
 
 	// Check if configured database exists
@@ -290,7 +221,7 @@ func CheckDatabaseConfig(repoPath string) DoctorCheck {
 		dbPath := cfg.DatabasePath(beadsDir)
 		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 			// Check if other .db files exist
-			entries, _ := os.ReadDir(beadsDir)
+			entries, _ := os.ReadDir(beadsDir) // Best effort: nil entries means no legacy files to check
 			var otherDBs []string
 			for _, entry := range entries {
 				if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".db") {
@@ -319,7 +250,7 @@ func CheckDatabaseConfig(repoPath string) DoctorCheck {
 		jsonlPath := cfg.JSONLPath(beadsDir)
 		if _, err := os.Stat(jsonlPath); os.IsNotExist(err) {
 			// Check if other .jsonl files exist
-			entries, _ := os.ReadDir(beadsDir)
+			entries, _ := os.ReadDir(beadsDir) // Best effort: nil entries means no legacy files to check
 			var otherJSONLs []string
 			for _, entry := range entries {
 				if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".jsonl") {
@@ -446,12 +377,6 @@ func CheckFreshClone(repoPath string) DoctorCheck {
 	fixCmd := "bd init"
 	if prefix != "" {
 		fixCmd = fmt.Sprintf("bd init --prefix %s", prefix)
-	}
-	if backend == configfile.BackendDolt {
-		fixCmd = "bd init --backend dolt"
-		if prefix != "" {
-			fixCmd = fmt.Sprintf("bd init --backend dolt --prefix %s", prefix)
-		}
 	}
 
 	return DoctorCheck{

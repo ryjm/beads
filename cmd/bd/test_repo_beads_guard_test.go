@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +27,17 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	defer func() { _ = os.RemoveAll(tmp) }()
+
+	// Preserve Go build cache before changing HOME.
+	// On macOS, GOCACHE defaults to $HOME/Library/Caches/go-build.
+	// Changing HOME would cause tests that run `go build` (e.g., TestShow)
+	// to miss the cache and do a full CGO rebuild (~80s each).
+	if os.Getenv("GOCACHE") == "" {
+		if out, err := exec.Command("go", "env", "GOCACHE").Output(); err == nil {
+			_ = os.Setenv("GOCACHE", strings.TrimSpace(string(out)))
+		}
+	}
+
 	_ = os.Setenv("HOME", tmp)
 	_ = os.Setenv("USERPROFILE", tmp) // Windows compatibility
 	_ = os.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "xdg-config"))
@@ -37,6 +49,11 @@ func TestMain(m *testing.M) {
 	// Enable test mode that forces accessor functions to use legacy globals.
 	// This ensures backward compatibility with tests that manipulate globals directly.
 	enableTestModeGlobals()
+
+	// Set BEADS_TEST_MODE once for the entire test run (bd-cqjoi).
+	// Previously each test set/unset this env var via ensureTestMode(),
+	// which raced under t.Parallel().
+	_ = os.Setenv("BEADS_TEST_MODE", "1")
 
 	// Prevent daemon auto-start and ensure tests don't interact with any running daemon.
 	// This prevents false positives in the test guard when a background daemon touches
@@ -89,7 +106,7 @@ func TestMain(m *testing.M) {
 		"issues.jsonl",
 		"beads.jsonl",
 		"metadata.json",
-		"interactions.jsonl",
+		// interactions.jsonl excluded: legitimately created by init during tests
 		"deletions.jsonl",
 		"molecules.jsonl",
 		"daemon.lock",

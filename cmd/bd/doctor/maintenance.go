@@ -1,3 +1,5 @@
+//go:build cgo
+
 package doctor
 
 import (
@@ -9,10 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/configfile"
-	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/factory"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -31,17 +31,7 @@ import (
 const largeClosedIssuesThreshold = 10000
 
 func CheckStaleClosedIssues(path string) DoctorCheck {
-	backend, beadsDir := getBackendAndBeadsDir(path)
-
-	// Dolt backend: this check uses SQLite-specific queries, skip for now
-	if backend == configfile.BackendDolt {
-		return DoctorCheck{
-			Name:     "Stale Closed Issues",
-			Status:   StatusOK,
-			Message:  "N/A (dolt backend)",
-			Category: CategoryMaintenance,
-		}
-	}
+	_, beadsDir := getBackendAndBeadsDir(path)
 
 	// Load config and check if this check is enabled
 	cfg, err := configfile.Load(beadsDir)
@@ -60,9 +50,11 @@ func CheckStaleClosedIssues(path string) DoctorCheck {
 		thresholdDays = cfg.GetStaleClosedIssuesDays()
 	}
 
-	// Open database using factory to respect backend configuration (bd-m2jr: SQLite fallback fix)
-	ctx := context.Background()
-	store, err := factory.NewFromConfig(ctx, beadsDir)
+	// Use SQL COUNT queries instead of loading all issues into memory.
+	// The old approach loaded every closed issue via SearchIssues which was
+	// catastrophically slow on large databases (57 seconds for ~23k issues
+	// over MySQL wire protocol).
+	db, store, err := openStoreDB(beadsDir)
 	if err != nil {
 		return DoctorCheck{
 			Name:     "Stale Closed Issues",
@@ -75,10 +67,9 @@ func CheckStaleClosedIssues(path string) DoctorCheck {
 
 	// If disabled (0), check for large closed issue count and warn if appropriate
 	if thresholdDays == 0 {
-		statusClosed := types.StatusClosed
-		filter := types.IssueFilter{Status: &statusClosed}
-		issues, err := store.SearchIssues(ctx, "", filter)
-		if err != nil || len(issues) < largeClosedIssuesThreshold {
+		var closedCount int
+		err := db.QueryRow("SELECT COUNT(*) FROM issues WHERE status = 'closed'").Scan(&closedCount)
+		if err != nil || closedCount < largeClosedIssuesThreshold {
 			return DoctorCheck{
 				Name:     "Stale Closed Issues",
 				Status:   StatusOK,
@@ -90,36 +81,26 @@ func CheckStaleClosedIssues(path string) DoctorCheck {
 		return DoctorCheck{
 			Name:     "Stale Closed Issues",
 			Status:   StatusWarning,
-			Message:  fmt.Sprintf("Disabled but %d closed issues exist", len(issues)),
+			Message:  fmt.Sprintf("Disabled but %d closed issues exist", closedCount),
 			Detail:   "Consider enabling stale_closed_issues_days to manage database size",
 			Fix:      "Add \"stale_closed_issues_days\": 30 to .beads/metadata.json",
 			Category: CategoryMaintenance,
 		}
 	}
 
-	// Find closed issues older than configured threshold
-	cutoff := time.Now().AddDate(0, 0, -thresholdDays)
-	statusClosed := types.StatusClosed
-	filter := types.IssueFilter{
-		Status:       &statusClosed,
-		ClosedBefore: &cutoff,
-	}
-
-	issues, err := store.SearchIssues(ctx, "", filter)
+	// Find closed issues older than configured threshold, excluding pinned
+	cutoff := time.Now().AddDate(0, 0, -thresholdDays).Format(time.RFC3339)
+	var cleanable int
+	err = db.QueryRow(
+		"SELECT COUNT(*) FROM issues WHERE status = 'closed' AND closed_at < ? AND (pinned = 0 OR pinned IS NULL)",
+		cutoff,
+	).Scan(&cleanable)
 	if err != nil {
 		return DoctorCheck{
 			Name:     "Stale Closed Issues",
 			Status:   StatusOK,
 			Message:  "N/A (query failed)",
 			Category: CategoryMaintenance,
-		}
-	}
-
-	// Filter out pinned issues
-	var cleanable int
-	for _, issue := range issues {
-		if !issue.Pinned {
-			cleanable++
 		}
 	}
 
@@ -142,86 +123,15 @@ func CheckStaleClosedIssues(path string) DoctorCheck {
 	}
 }
 
-// CheckExpiredTombstones detects tombstones that have exceeded their TTL.
-func CheckExpiredTombstones(path string) DoctorCheck {
-	// Follow redirect to resolve actual beads directory
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
-	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-
-	if _, err := os.Stat(jsonlPath); os.IsNotExist(err) {
-		return DoctorCheck{
-			Name:     "Expired Tombstones",
-			Status:   StatusOK,
-			Message:  "N/A (no JSONL file)",
-			Category: CategoryMaintenance,
-		}
-	}
-
-	// Read JSONL and count expired tombstones
-	file, err := os.Open(jsonlPath) // #nosec G304 - path constructed safely
-	if err != nil {
-		return DoctorCheck{
-			Name:     "Expired Tombstones",
-			Status:   StatusOK,
-			Message:  "N/A (unable to read JSONL)",
-			Category: CategoryMaintenance,
-		}
-	}
-	defer file.Close()
-
-	var expiredCount int
-	decoder := json.NewDecoder(file)
-	ttl := types.DefaultTombstoneTTL
-
-	for {
-		var issue types.Issue
-		if err := decoder.Decode(&issue); err != nil {
-			break
-		}
-		issue.SetDefaults()
-		if issue.IsExpired(ttl) {
-			expiredCount++
-		}
-	}
-
-	if expiredCount == 0 {
-		return DoctorCheck{
-			Name:     "Expired Tombstones",
-			Status:   StatusOK,
-			Message:  "No expired tombstones",
-			Category: CategoryMaintenance,
-		}
-	}
-
-	ttlDays := int(ttl.Hours() / 24)
-	return DoctorCheck{
-		Name:     "Expired Tombstones",
-		Status:   StatusWarning,
-		Message:  fmt.Sprintf("%d tombstone(s) older than %d days", expiredCount, ttlDays),
-		Detail:   "Expired tombstones can be pruned to reduce JSONL file size",
-		Fix:      "Run 'bd doctor --fix' to prune, or 'bd admin cleanup --force' for more options",
-		Category: CategoryMaintenance,
-	}
-}
-
 // CheckStaleMolecules detects complete-but-unclosed molecules.
 // A molecule is stale if all children are closed but the root is still open.
 func CheckStaleMolecules(path string) DoctorCheck {
-	backend, beadsDir := getBackendAndBeadsDir(path)
+	_, beadsDir := getBackendAndBeadsDir(path)
 
-	// Dolt backend: this check uses SQLite-specific queries, skip for now
-	if backend == configfile.BackendDolt {
-		return DoctorCheck{
-			Name:     "Stale Molecules",
-			Status:   StatusOK,
-			Message:  "N/A (dolt backend)",
-			Category: CategoryMaintenance,
-		}
-	}
-
-	// Open database using factory to respect backend configuration (bd-m2jr: SQLite fallback fix)
+	// Open database using Dolt
 	ctx := context.Background()
-	store, err := factory.NewFromConfig(ctx, beadsDir)
+	doltPath := filepath.Join(beadsDir, "dolt")
+	store, err := dolt.New(ctx, &dolt.Config{Path: doltPath, ReadOnly: true})
 	if err != nil {
 		return DoctorCheck{
 			Name:     "Stale Molecules",
@@ -283,94 +193,14 @@ func CheckStaleMolecules(path string) DoctorCheck {
 // Note: Compaction is a SQLite-specific optimization. Dolt backends don't need compaction
 // as Dolt handles data management differently.
 func CheckCompactionCandidates(path string) DoctorCheck {
-	backend, beadsDir := getBackendAndBeadsDir(path)
-
-	// Dolt backend: this check uses SQLite-specific queries, skip for now
-	if backend == configfile.BackendDolt {
-		return DoctorCheck{
-			Name:     "Compaction Candidates",
-			Status:   StatusOK,
-			Message:  "N/A (dolt backend)",
-			Category: CategoryMaintenance,
-		}
-	}
-
-	// Check if backend is SQLite - compaction only applies to SQLite
-	cfg, _ := configfile.Load(beadsDir)
-	if cfg != nil && cfg.GetBackend() != configfile.BackendSQLite {
-		return DoctorCheck{
-			Name:     "Compaction Candidates",
-			Status:   StatusOK,
-			Message:  "N/A (compaction only applies to SQLite backend)",
-			Category: CategoryMaintenance,
-		}
-	}
-
-	// Open database using factory
-	ctx := context.Background()
-	store, err := factory.NewFromConfig(ctx, beadsDir)
-	if err != nil {
-		return DoctorCheck{
-			Name:     "Compaction Candidates",
-			Status:   StatusOK,
-			Message:  "N/A (unable to open database)",
-			Category: CategoryMaintenance,
-		}
-	}
-	defer func() { _ = store.Close() }()
-
-	// Type assert to CompactableStorage for compaction methods
-	compactStore, ok := store.(storage.CompactableStorage)
-	if !ok {
-		return DoctorCheck{
-			Name:     "Compaction Candidates",
-			Status:   StatusOK,
-			Message:  "N/A (backend does not support compaction)",
-			Category: CategoryMaintenance,
-		}
-	}
-
-	tier1, err := compactStore.GetTier1Candidates(ctx)
-	if err != nil {
-		return DoctorCheck{
-			Name:     "Compaction Candidates",
-			Status:   StatusOK,
-			Message:  "N/A (query failed)",
-			Category: CategoryMaintenance,
-		}
-	}
-
-	if len(tier1) == 0 {
-		return DoctorCheck{
-			Name:     "Compaction Candidates",
-			Status:   StatusOK,
-			Message:  "No compaction candidates",
-			Category: CategoryMaintenance,
-		}
-	}
-
-	// Calculate total size
-	var totalSize int
-	for _, c := range tier1 {
-		totalSize += c.OriginalSize
-	}
-
+	// Compaction was a SQLite-specific optimization. Dolt (the only backend)
+	// handles data management differently and doesn't need compaction.
 	return DoctorCheck{
 		Name:     "Compaction Candidates",
-		Status:   StatusOK, // Info only, not a warning
-		Message:  fmt.Sprintf("%d issue(s) eligible for compaction (%d bytes)", len(tier1), totalSize),
-		Detail:   "Compaction requires agent review; not auto-fixable",
-		Fix:      "Run 'bd compact --analyze' to review candidates",
+		Status:   StatusOK,
+		Message:  "N/A (compaction only applies to SQLite backend)",
 		Category: CategoryMaintenance,
 	}
-}
-
-// resolveBeadsDir follows a redirect file if present in the beads directory.
-// This handles the redirect mechanism where .beads/redirect points to
-// the actual beads directory location (used in multi-clone setups).
-// This is a wrapper around beads.FollowRedirect for use within the doctor package.
-func resolveBeadsDir(beadsDir string) string {
-	return beads.FollowRedirect(beadsDir)
 }
 
 // CheckPersistentMolIssues detects mol- prefixed issues that should have been ephemeral.
@@ -409,10 +239,6 @@ func CheckPersistentMolIssues(path string) DoctorCheck {
 		var issue types.Issue
 		if err := decoder.Decode(&issue); err != nil {
 			break
-		}
-		// Skip deleted issues (tombstones)
-		if issue.DeletedAt != nil {
-			continue
 		}
 		// Look for mol- prefix that shouldn't be in JSONL
 		// (ephemeral issues have Ephemeral=true and don't get exported)
@@ -501,10 +327,10 @@ func FixStaleMQFiles(path string) error {
 	return nil
 }
 
-// CheckMisclassifiedWisps detects wisp-patterned issues that lack the ephemeral flag.
+// checkMisclassifiedWisps detects wisp-patterned issues that lack the ephemeral flag.
 // Issues with IDs containing "-wisp-" should always have Ephemeral=true.
 // If they're in JSONL without the ephemeral flag, they'll pollute bd ready.
-func CheckMisclassifiedWisps(path string) DoctorCheck {
+func checkMisclassifiedWisps(path string) DoctorCheck {
 	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
 	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
 
@@ -537,10 +363,6 @@ func CheckMisclassifiedWisps(path string) DoctorCheck {
 		var issue types.Issue
 		if err := decoder.Decode(&issue); err != nil {
 			break
-		}
-		// Skip deleted issues (tombstones)
-		if issue.DeletedAt != nil {
-			continue
 		}
 		// Look for wisp pattern without ephemeral flag
 		// These shouldn't be in JSONL at all (wisps are ephemeral)
@@ -582,8 +404,8 @@ const (
 	SessionBeadThreshold  = 50 // Warn if session beads > 50
 )
 
-// PatrolPollutionResult contains counts of detected pollution beads
-type PatrolPollutionResult struct {
+// patrolPollutionResult contains counts of detected pollution beads
+type patrolPollutionResult struct {
 	PatrolDigestCount int      // Count of "Digest: mol-*-patrol" beads
 	SessionBeadCount  int      // Count of "Session ended: *" beads
 	PatrolDigestIDs   []string // Sample IDs for display
@@ -665,19 +487,14 @@ func CheckPatrolPollution(path string) DoctorCheck {
 }
 
 // detectPatrolPollution scans a JSONL file for patrol pollution patterns
-func detectPatrolPollution(file *os.File) PatrolPollutionResult {
-	var result PatrolPollutionResult
+func detectPatrolPollution(file *os.File) patrolPollutionResult {
+	var result patrolPollutionResult
 	decoder := json.NewDecoder(file)
 
 	for {
 		var issue types.Issue
 		if err := decoder.Decode(&issue); err != nil {
 			break
-		}
-
-		// Skip tombstones
-		if issue.DeletedAt != nil {
-			continue
 		}
 
 		title := issue.Title
@@ -703,8 +520,8 @@ func detectPatrolPollution(file *os.File) PatrolPollutionResult {
 	return result
 }
 
-// GetPatrolPollutionIDs returns all IDs of patrol pollution beads for deletion
-func GetPatrolPollutionIDs(path string) ([]string, error) {
+// getPatrolPollutionIDs returns all IDs of patrol pollution beads for deletion
+func getPatrolPollutionIDs(path string) ([]string, error) {
 	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
 	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
 
@@ -721,11 +538,6 @@ func GetPatrolPollutionIDs(path string) ([]string, error) {
 		var issue types.Issue
 		if err := decoder.Decode(&issue); err != nil {
 			break
-		}
-
-		// Skip tombstones
-		if issue.DeletedAt != nil {
-			continue
 		}
 
 		title := issue.Title

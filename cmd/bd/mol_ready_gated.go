@@ -7,7 +7,7 @@ import (
 	"sort"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -51,12 +51,7 @@ func runMolReadyGated(cmd *cobra.Command, args []string) {
 
 	// --gated mode requires direct store access
 	if store == nil {
-		if daemonClient != nil {
-			fmt.Fprintf(os.Stderr, "Error: bd ready --gated requires direct database access\n")
-			fmt.Fprintf(os.Stderr, "Hint: use --no-daemon flag: bd --no-daemon ready --gated\n")
-		} else {
-			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-		}
+		fmt.Fprintf(os.Stderr, "Error: no database connection\n")
 		os.Exit(1)
 	}
 
@@ -111,7 +106,7 @@ func runMolReadyGated(cmd *cobra.Command, args []string) {
 // 3. Check if that step is now ready (unblocked)
 // 4. Find the parent molecule
 // 5. Filter out molecules that are already hooked by someone
-func findGateReadyMolecules(ctx context.Context, s storage.Storage) ([]*GatedMolecule, error) {
+func findGateReadyMolecules(ctx context.Context, s *dolt.DoltStore) ([]*GatedMolecule, error) {
 	// Step 1: Find all closed gate beads
 	gateType := types.IssueType("gate")
 	closedStatus := types.StatusClosed

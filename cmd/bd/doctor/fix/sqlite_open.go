@@ -7,6 +7,13 @@ import (
 	"time"
 )
 
+// sqliteConnString builds a SQLite connection string with standard pragmas.
+// Inlined from the removed storage.SQLiteConnString after the Phase 7 refactor
+// removed the storage factory and connection string helpers.
+//
+// Includes busy_timeout (prevents "database is locked" under concurrency),
+// foreign_keys (enforces referential integrity), and time_format pragmas
+// that the simplified upstream version dropped.
 func sqliteConnString(path string, readOnly bool) string {
 	path = strings.TrimSpace(path)
 	if path == "" {

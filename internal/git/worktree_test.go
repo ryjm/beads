@@ -117,7 +117,7 @@ func TestCreateBeadsWorktree(t *testing.T) {
 
 	t.Run("idempotent - calling twice succeeds", func(t *testing.T) {
 		worktreePath2 := filepath.Join(t.TempDir(), "beads-worktree-idempotent")
-		
+
 		// Create once
 		if err := wm.CreateBeadsWorktree("beads-metadata-idempotent", worktreePath2); err != nil {
 			t.Fatalf("First CreateBeadsWorktree failed: %v", err)
@@ -127,7 +127,7 @@ func TestCreateBeadsWorktree(t *testing.T) {
 		if err := wm.CreateBeadsWorktree("beads-metadata-idempotent", worktreePath2); err != nil {
 			t.Errorf("Second CreateBeadsWorktree failed (should be idempotent): %v", err)
 		}
-		
+
 		// Verify worktree still exists and is valid
 		if valid, err := wm.isValidWorktree(worktreePath2); err != nil || !valid {
 			t.Errorf("Worktree should still be valid after idempotent call: valid=%v, err=%v", valid, err)
@@ -171,7 +171,7 @@ func TestCheckWorktreeHealth(t *testing.T) {
 
 	t.Run("healthy worktree passes check", func(t *testing.T) {
 		worktreePath := filepath.Join(t.TempDir(), "beads-worktree")
-		
+
 		if err := wm.CreateBeadsWorktree("beads-metadata", worktreePath); err != nil {
 			t.Fatalf("CreateBeadsWorktree failed: %v", err)
 		}
@@ -183,7 +183,7 @@ func TestCheckWorktreeHealth(t *testing.T) {
 
 	t.Run("non-existent path fails check", func(t *testing.T) {
 		nonExistentPath := filepath.Join(t.TempDir(), "does-not-exist")
-		
+
 		err := wm.CheckWorktreeHealth(nonExistentPath)
 		if err == nil {
 			t.Error("CheckWorktreeHealth should fail for non-existent path")
@@ -280,7 +280,7 @@ func TestIsValidWorktree(t *testing.T) {
 
 	t.Run("created worktree is valid", func(t *testing.T) {
 		worktreePath := filepath.Join(t.TempDir(), "beads-worktree")
-		
+
 		if err := wm.CreateBeadsWorktree("beads-metadata", worktreePath); err != nil {
 			t.Fatalf("CreateBeadsWorktree failed: %v", err)
 		}
@@ -636,18 +636,17 @@ func TestSyncJSONLToWorktreeMerge(t *testing.T) {
 			t.Fatalf("Failed to read result JSONL: %v", err)
 		}
 
-		// Should have all 4 issues (3 from worktree + 1 from local)
+		// 3-way merge removed: mergeJSONLFiles now returns srcData (local wins).
+		// When local has fewer issues, srcData (1 issue) overwrites destination.
 		resultCount := countJSONLIssues(resultData)
-		if resultCount != 4 {
-			t.Errorf("Expected 4 issues after merge, got %d\nContent:\n%s", resultCount, string(resultData))
+		if resultCount != 1 {
+			t.Errorf("Expected 1 issue after local-wins overwrite, got %d\nContent:\n%s", resultCount, string(resultData))
 		}
 
-		// Verify specific issues are present
+		// Verify the local issue is present
 		resultStr := string(resultData)
-		for _, id := range []string{"bd-001", "bd-002", "bd-003", "bd-004"} {
-			if !strings.Contains(resultStr, id) {
-				t.Errorf("Expected issue %s to be in merged result", id)
-			}
+		if !strings.Contains(resultStr, "bd-004") {
+			t.Errorf("Expected issue bd-004 to be in result")
 		}
 	})
 
@@ -798,18 +797,17 @@ func TestSyncJSONLToWorktree_DeleteMutation(t *testing.T) {
 			t.Fatalf("Failed to read result JSONL: %v", err)
 		}
 
-		// Should have all 4 issues (3 from remote + 1 from local, merged)
+		// 3-way merge removed: mergeJSONLFiles now returns srcData (local wins).
+		// When local has fewer issues, srcData (1 issue) overwrites destination.
 		resultCount := countJSONLIssues(resultData)
-		if resultCount != 4 {
-			t.Errorf("Expected 4 issues after merge, got %d\nContent:\n%s", resultCount, string(resultData))
+		if resultCount != 1 {
+			t.Errorf("Expected 1 issue after local-wins overwrite, got %d\nContent:\n%s", resultCount, string(resultData))
 		}
 
-		// Verify all issues are present
+		// Verify the local issue is present
 		resultStr := string(resultData)
-		for _, id := range []string{"bd-200", "bd-201", "bd-202", "bd-203"} {
-			if !strings.Contains(resultStr, id) {
-				t.Errorf("Expected issue %s to be in merged result", id)
-			}
+		if !strings.Contains(resultStr, "bd-203") {
+			t.Errorf("Expected issue bd-203 to be in result")
 		}
 	})
 }

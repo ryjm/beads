@@ -2,22 +2,21 @@
 package main
 
 import (
-	"os"
 	"strings"
 	"testing"
 )
 
 // TestGitLabConfigFromEnv verifies config is read from environment variables.
 func TestGitLabConfigFromEnv(t *testing.T) {
+	// Clear global state to avoid stale connections from prior tests
+	oldDBPath, oldStore := dbPath, store
+	dbPath, store = "", nil
+	t.Cleanup(func() { dbPath, store = oldDBPath, oldStore })
+
 	// Set environment variables
-	os.Setenv("GITLAB_URL", "https://gitlab.example.com")
-	os.Setenv("GITLAB_TOKEN", "test-token-123")
-	os.Setenv("GITLAB_PROJECT_ID", "42")
-	defer func() {
-		os.Unsetenv("GITLAB_URL")
-		os.Unsetenv("GITLAB_TOKEN")
-		os.Unsetenv("GITLAB_PROJECT_ID")
-	}()
+	t.Setenv("GITLAB_URL", "https://gitlab.example.com")
+	t.Setenv("GITLAB_TOKEN", "test-token-123")
+	t.Setenv("GITLAB_PROJECT_ID", "42")
 
 	config := getGitLabConfig()
 
@@ -147,14 +146,14 @@ func TestGitLabConfigEnvVar(t *testing.T) {
 
 // TestGitLabClientCreation verifies client is created with correct config.
 func TestGitLabClientCreation(t *testing.T) {
-	os.Setenv("GITLAB_URL", "https://gitlab.test.com")
-	os.Setenv("GITLAB_TOKEN", "test-token-abc")
-	os.Setenv("GITLAB_PROJECT_ID", "99")
-	defer func() {
-		os.Unsetenv("GITLAB_URL")
-		os.Unsetenv("GITLAB_TOKEN")
-		os.Unsetenv("GITLAB_PROJECT_ID")
-	}()
+	// Clear global state to avoid stale connections from prior tests
+	oldDBPath, oldStore := dbPath, store
+	dbPath, store = "", nil
+	t.Cleanup(func() { dbPath, store = oldDBPath, oldStore })
+
+	t.Setenv("GITLAB_URL", "https://gitlab.test.com")
+	t.Setenv("GITLAB_TOKEN", "test-token-abc")
+	t.Setenv("GITLAB_PROJECT_ID", "99")
 
 	config := getGitLabConfig()
 	client := getGitLabClient(config)

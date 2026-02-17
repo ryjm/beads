@@ -8,7 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/beads"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -42,7 +42,7 @@ func issueIDCompletion(cmd *cobra.Command, args []string, toComplete string) ([]
 		if lockTimeout > 0 {
 			timeout = lockTimeout
 		}
-		currentStore, err = sqlite.NewReadOnlyWithTimeout(ctx, currentDBPath, timeout)
+		currentStore, err = dolt.New(ctx, &dolt.Config{Path: currentDBPath, ReadOnly: true, OpenTimeout: timeout})
 		if err != nil {
 			// If we can't open database, return empty completion
 			return nil, cobra.ShellCompDirectiveNoFileComp

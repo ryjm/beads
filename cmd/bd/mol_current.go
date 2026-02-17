@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -10,8 +9,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/rpc"
-	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -23,14 +21,14 @@ const LargeMoleculeThreshold = 100
 
 // MoleculeProgress holds the progress information for a molecule
 type MoleculeProgress struct {
-	MoleculeID    string         `json:"molecule_id"`
-	MoleculeTitle string         `json:"molecule_title"`
-	Assignee      string         `json:"assignee,omitempty"`
-	CurrentStep   *types.Issue   `json:"current_step,omitempty"`
-	NextStep      *types.Issue   `json:"next_step,omitempty"`
-	Steps         []*StepStatus  `json:"steps"`
-	Completed     int            `json:"completed"`
-	Total         int            `json:"total"`
+	MoleculeID    string        `json:"molecule_id"`
+	MoleculeTitle string        `json:"molecule_title"`
+	Assignee      string        `json:"assignee,omitempty"`
+	CurrentStep   *types.Issue  `json:"current_step,omitempty"`
+	NextStep      *types.Issue  `json:"next_step,omitempty"`
+	Steps         []*StepStatus `json:"steps"`
+	Completed     int           `json:"completed"`
+	Total         int           `json:"total"`
 }
 
 // StepStatus represents the status of a step in a molecule
@@ -72,14 +70,8 @@ Use --limit or --range to view specific steps:
 			agent = actor // Default to current user/agent
 		}
 
-		// mol current requires direct store access for subgraph loading
 		if store == nil {
-			if daemonClient != nil {
-				fmt.Fprintf(os.Stderr, "Error: mol current requires direct database access\n")
-				fmt.Fprintf(os.Stderr, "Hint: use --no-daemon flag: bd --no-daemon mol current\n")
-			} else {
-				fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-			}
+			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
 			os.Exit(1)
 		}
 
@@ -176,7 +168,7 @@ Use --limit or --range to view specific steps:
 }
 
 // getMoleculeProgress loads a molecule and computes progress
-func getMoleculeProgress(ctx context.Context, s storage.Storage, moleculeID string) (*MoleculeProgress, error) {
+func getMoleculeProgress(ctx context.Context, s *dolt.DoltStore, moleculeID string) (*MoleculeProgress, error) {
 	subgraph, err := loadTemplateSubgraph(ctx, s, moleculeID)
 	if err != nil {
 		return nil, err
@@ -189,13 +181,15 @@ func getMoleculeProgress(ctx context.Context, s storage.Storage, moleculeID stri
 		Total:         len(subgraph.Issues) - 1, // Exclude root
 	}
 
-	// Get ready issues for this molecule
-	// IncludeMolSteps: true because we specifically need to see molecule steps here
+	// Compute step readiness from within-molecule dependencies.
+	// Uses analyzeMoleculeParallel instead of GetReadyWork because GetReadyWork
+	// excludes ephemeral issues (wisp steps are ephemeral by definition).
+	// See: https://github.com/steveyegge/gastown/issues/1276
+	analysis := analyzeMoleculeParallel(subgraph)
 	readyIDs := make(map[string]bool)
-	readyIssues, err := s.GetReadyWork(ctx, types.WorkFilter{IncludeMolSteps: true})
-	if err == nil {
-		for _, issue := range readyIssues {
-			readyIDs[issue.ID] = true
+	for id, info := range analysis.Steps {
+		if info.IsReady {
+			readyIDs[id] = true
 		}
 	}
 
@@ -253,30 +247,17 @@ func getMoleculeProgress(ctx context.Context, s storage.Storage, moleculeID stri
 }
 
 // findInProgressMolecules finds molecules with in_progress steps for an agent
-func findInProgressMolecules(ctx context.Context, s storage.Storage, agent string) []*MoleculeProgress {
-	// Query for in_progress issues
+func findInProgressMolecules(ctx context.Context, s *dolt.DoltStore, agent string) []*MoleculeProgress {
 	var inProgressIssues []*types.Issue
 
-	if daemonClient != nil {
-		listArgs := &rpc.ListArgs{
-			Status:   "in_progress",
-			Assignee: agent,
-		}
-		resp, err := daemonClient.List(listArgs)
-		if err == nil {
-			_ = json.Unmarshal(resp.Data, &inProgressIssues)
-		}
-	} else {
-		// Direct query - search for in_progress issues
-		status := types.StatusInProgress
-		filter := types.IssueFilter{Status: &status}
-		if agent != "" {
-			filter.Assignee = &agent
-		}
-		allIssues, err := s.SearchIssues(ctx, "", filter)
-		if err == nil {
-			inProgressIssues = allIssues
-		}
+	status := types.StatusInProgress
+	filter := types.IssueFilter{Status: &status}
+	if agent != "" {
+		filter.Assignee = &agent
+	}
+	allIssues, err := s.SearchIssues(ctx, "", filter)
+	if err == nil {
+		inProgressIssues = allIssues
 	}
 
 	if len(inProgressIssues) == 0 {
@@ -317,7 +298,7 @@ func findInProgressMolecules(ctx context.Context, s storage.Storage, agent strin
 // findHookedMolecules finds molecules bonded to hooked issues for an agent.
 // This is a fallback when no in_progress steps exist but a molecule is attached
 // to the agent's hooked work via a "blocks" dependency.
-func findHookedMolecules(ctx context.Context, s storage.Storage, agent string) []*MoleculeProgress {
+func findHookedMolecules(ctx context.Context, s *dolt.DoltStore, agent string) []*MoleculeProgress {
 	// Query for hooked issues assigned to the agent
 	status := types.StatusHooked
 	filter := types.IssueFilter{Status: &status}
@@ -385,7 +366,7 @@ func findHookedMolecules(ctx context.Context, s storage.Storage, agent string) [
 }
 
 // findParentMolecule walks up parent-child chain to find the root molecule
-func findParentMolecule(ctx context.Context, s storage.Storage, issueID string) string {
+func findParentMolecule(ctx context.Context, s *dolt.DoltStore, issueID string) string {
 	visited := make(map[string]bool)
 	currentID := issueID
 
@@ -524,7 +505,7 @@ type ContinueResult struct {
 // AdvanceToNextStep finds the next ready step in a molecule after closing a step
 // If autoClaim is true, it marks the next step as in_progress
 // Returns nil if the issue is not part of a molecule
-func AdvanceToNextStep(ctx context.Context, s storage.Storage, closedStepID string, autoClaim bool, actorName string) (*ContinueResult, error) {
+func AdvanceToNextStep(ctx context.Context, s *dolt.DoltStore, closedStepID string, autoClaim bool, actorName string) (*ContinueResult, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
 	}

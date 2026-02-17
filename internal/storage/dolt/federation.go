@@ -18,7 +18,7 @@ import (
 func (s *DoltStore) PushTo(ctx context.Context, peer string) error {
 	return s.withPeerCredentials(ctx, peer, func() error {
 		// DOLT_PUSH(remote, branch)
-		_, err := s.db.ExecContext(ctx, "CALL DOLT_PUSH(?, ?)", peer, s.branch)
+		_, err := s.execContext(ctx, "CALL DOLT_PUSH(?, ?)", peer, s.branch)
 		if err != nil {
 			return fmt.Errorf("failed to push to peer %s: %w", peer, err)
 		}
@@ -33,7 +33,7 @@ func (s *DoltStore) PullFrom(ctx context.Context, peer string) ([]storage.Confli
 	var conflicts []storage.Conflict
 	err := s.withPeerCredentials(ctx, peer, func() error {
 		// DOLT_PULL(remote) - pulls and merges
-		_, pullErr := s.db.ExecContext(ctx, "CALL DOLT_PULL(?)", peer)
+		_, pullErr := s.execContext(ctx, "CALL DOLT_PULL(?)", peer)
 		if pullErr != nil {
 			// Check if the error is due to merge conflicts
 			c, conflictErr := s.GetConflicts(ctx)
@@ -53,7 +53,7 @@ func (s *DoltStore) PullFrom(ctx context.Context, peer string) ([]storage.Confli
 func (s *DoltStore) Fetch(ctx context.Context, peer string) error {
 	return s.withPeerCredentials(ctx, peer, func() error {
 		// DOLT_FETCH(remote)
-		_, err := s.db.ExecContext(ctx, "CALL DOLT_FETCH(?)", peer)
+		_, err := s.execContext(ctx, "CALL DOLT_FETCH(?)", peer)
 		if err != nil {
 			return fmt.Errorf("failed to fetch from peer %s: %w", peer, err)
 		}
@@ -63,7 +63,7 @@ func (s *DoltStore) Fetch(ctx context.Context, peer string) error {
 
 // ListRemotes returns configured remote names and URLs.
 func (s *DoltStore) ListRemotes(ctx context.Context) ([]storage.RemoteInfo, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT name, url FROM dolt_remotes")
+	rows, err := s.queryContext(ctx, "SELECT name, url FROM dolt_remotes")
 	if err != nil {
 		return nil, fmt.Errorf("failed to list remotes: %w", err)
 	}
@@ -82,7 +82,7 @@ func (s *DoltStore) ListRemotes(ctx context.Context) ([]storage.RemoteInfo, erro
 
 // RemoveRemote removes a configured remote.
 func (s *DoltStore) RemoveRemote(ctx context.Context, name string) error {
-	_, err := s.db.ExecContext(ctx, "CALL DOLT_REMOTE('remove', ?)", name)
+	_, err := s.execContext(ctx, "CALL DOLT_REMOTE('remove', ?)", name)
 	if err != nil {
 		return fmt.Errorf("failed to remove remote %s: %w", name, err)
 	}
@@ -145,7 +145,7 @@ func (s *DoltStore) getLastSyncTime(ctx context.Context, peer string) time.Time 
 func (s *DoltStore) setLastSyncTime(ctx context.Context, peer string) error {
 	key := "last_sync_" + peer
 	value := time.Now().Format(time.RFC3339)
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.execContext(ctx,
 		"REPLACE INTO metadata (`key`, value) VALUES (?, ?)", key, value)
 	return err
 }
@@ -170,7 +170,7 @@ func (s *DoltStore) Sync(ctx context.Context, peer string, strategy string) (*Sy
 	result.Fetched = true
 
 	// Step 2: Get status before merge
-	beforeCommit, _ := s.GetCurrentCommit(ctx)
+	beforeCommit, _ := s.GetCurrentCommit(ctx) // Best effort: empty commit hash means diff won't be logged
 
 	// Step 3: Merge peer's branch
 	remoteBranch := fmt.Sprintf("%s/%s", peer, s.branch)
@@ -208,7 +208,7 @@ func (s *DoltStore) Sync(ctx context.Context, peer string, strategy string) (*Sy
 	result.Merged = true
 
 	// Count pulled commits
-	afterCommit, _ := s.GetCurrentCommit(ctx)
+	afterCommit, _ := s.GetCurrentCommit(ctx) // Best effort: empty commit hash means diff won't be logged
 	if beforeCommit != afterCommit {
 		result.PulledCommits = 1 // Simplified - could count actual commits
 	}
@@ -222,7 +222,7 @@ func (s *DoltStore) Sync(ctx context.Context, peer string, strategy string) (*Sy
 	}
 
 	// Record last sync time
-	_ = s.setLastSyncTime(ctx, peer)
+	_ = s.setLastSyncTime(ctx, peer) // Best effort: sync timestamp is advisory for scheduling
 
 	result.EndTime = time.Now()
 	return result, nil

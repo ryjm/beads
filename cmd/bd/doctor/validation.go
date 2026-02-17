@@ -1,18 +1,37 @@
+//go:build cgo
+
 package doctor
 
 import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/steveyegge/beads/internal/beads"
-	"github.com/steveyegge/beads/internal/storage/factory"
-	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 )
+
+// openStoreDB opens the beads database and returns the underlying *sql.DB for
+// raw queries. The caller must close the returned store when done.
+func openStoreDB(beadsDir string) (*sql.DB, *dolt.DoltStore, error) {
+	ctx := context.Background()
+	doltPath := filepath.Join(beadsDir, "dolt")
+	store, err := dolt.New(ctx, &dolt.Config{Path: doltPath, ReadOnly: true})
+	if err != nil {
+		return nil, nil, err
+	}
+	db := store.UnderlyingDB()
+	if db == nil {
+		_ = store.Close() // Best effort cleanup
+		return nil, nil, fmt.Errorf("storage backend has no underlying database")
+	}
+	return db, store, nil
+}
 
 // CheckMergeArtifacts detects temporary git merge files in .beads directory.
 // These are created during git merges and should be cleaned up.
@@ -112,26 +131,16 @@ func readMergeArtifactPatterns(beadsDir string) ([]string, error) {
 func CheckOrphanedDependencies(path string) DoctorCheck {
 	// Follow redirect to resolve actual beads directory (bd-tvus fix)
 	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
-	dbPath := filepath.Join(beadsDir, beads.CanonicalDatabaseName)
 
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	db, store, err := openStoreDB(beadsDir)
+	if err != nil {
 		return DoctorCheck{
 			Name:    "Orphaned Dependencies",
 			Status:  "ok",
 			Message: "N/A (no database)",
 		}
 	}
-
-	// Open database read-only
-	db, err := openDBReadOnly(dbPath)
-	if err != nil {
-		return DoctorCheck{
-			Name:    "Orphaned Dependencies",
-			Status:  "ok",
-			Message: "N/A (unable to open database)",
-		}
-	}
-	defer db.Close()
+	defer func() { _ = store.Close() }()
 
 	// Query for orphaned dependencies
 	query := `
@@ -187,20 +196,35 @@ func CheckDuplicateIssues(path string, gastownMode bool, gastownThreshold int) D
 	// Follow redirect to resolve actual beads directory (bd-tvus fix)
 	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
 
-	// Open store using factory to respect backend configuration (bd-m2jr: SQLite fallback fix)
-	ctx := context.Background()
-	store, err := factory.NewFromConfig(ctx, beadsDir)
+	// Use SQL aggregation to find duplicates without loading all issues into memory.
+	// The old approach loaded every issue via SearchIssues which was O(n) in both
+	// time and memory — catastrophically slow on large databases (e.g., 23k+ issues
+	// took 66 seconds over MySQL wire protocol).
+	db, store, err := openStoreDB(beadsDir)
 	if err != nil {
 		return DoctorCheck{
 			Name:    "Duplicate Issues",
-			Status:  "ok",
-			Message: "N/A (unable to open database)",
+			Status:  StatusOK,
+			Message: "N/A (no database)",
 		}
 	}
 	defer func() { _ = store.Close() }()
 
-	issues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
-	if err != nil {
+	// Count duplicate groups and total duplicates using SQL GROUP BY.
+	// This matches the original algorithm: group by title|description|design|acceptance_criteria|status,
+	// only for non-closed issues.
+	query := `
+		SELECT COUNT(*) as group_count, SUM(cnt - 1) as dup_count
+		FROM (
+			SELECT COUNT(*) as cnt
+			FROM issues
+			WHERE status != 'closed'
+			GROUP BY title, description, design, acceptance_criteria, status
+			HAVING COUNT(*) > 1
+		) dups
+	`
+	var groupCount, dupCount sql.NullInt64
+	if err := db.QueryRow(query).Scan(&groupCount, &dupCount); err != nil {
 		return DoctorCheck{
 			Name:    "Duplicate Issues",
 			Status:  "ok",
@@ -208,26 +232,8 @@ func CheckDuplicateIssues(path string, gastownMode bool, gastownThreshold int) D
 		}
 	}
 
-	// Find duplicates by content hash (matching bd duplicates algorithm)
-	// Only check open issues - closed issues are done, no point flagging duplicates
-	seen := make(map[string][]string) // hash -> list of IDs
-	for _, issue := range issues {
-		if issue.Status == types.StatusTombstone || issue.Status == types.StatusClosed {
-			continue
-		}
-		// Content key matches bd duplicates: title + description + design + acceptanceCriteria + status
-		key := issue.Title + "|" + issue.Description + "|" + issue.Design + "|" + issue.AcceptanceCriteria + "|" + string(issue.Status)
-		seen[key] = append(seen[key], issue.ID)
-	}
-
-	var duplicateGroups int
-	var totalDuplicates int
-	for _, ids := range seen {
-		if len(ids) > 1 {
-			duplicateGroups++
-			totalDuplicates += len(ids) - 1 // exclude the canonical one
-		}
-	}
+	duplicateGroups := int(groupCount.Int64)
+	totalDuplicates := int(dupCount.Int64)
 
 	// Apply threshold based on mode
 	threshold := 0 // Default: any duplicates are warnings
@@ -270,31 +276,21 @@ func CheckDuplicateIssues(path string, gastownMode bool, gastownThreshold int) D
 func CheckTestPollution(path string) DoctorCheck {
 	// Follow redirect to resolve actual beads directory (bd-tvus fix)
 	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
-	dbPath := filepath.Join(beadsDir, beads.CanonicalDatabaseName)
 
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	db, store, err := openStoreDB(beadsDir)
+	if err != nil {
 		return DoctorCheck{
 			Name:    "Test Pollution",
 			Status:  "ok",
 			Message: "N/A (no database)",
 		}
 	}
-
-	db, err := openDBReadOnly(dbPath)
-	if err != nil {
-		return DoctorCheck{
-			Name:    "Test Pollution",
-			Status:  "ok",
-			Message: "N/A (unable to open database)",
-		}
-	}
-	defer db.Close()
+	defer func() { _ = store.Close() }()
 
 	// Look for common test patterns in titles
 	query := `
 		SELECT COUNT(*) FROM issues
-		WHERE status != 'tombstone'
-		AND (
+		WHERE (
 			title LIKE 'test-%' OR
 			title LIKE 'Test Issue%' OR
 			title LIKE '%test issue%' OR
@@ -333,25 +329,16 @@ func CheckTestPollution(path string) DoctorCheck {
 func CheckChildParentDependencies(path string) DoctorCheck {
 	// Follow redirect to resolve actual beads directory (bd-tvus fix)
 	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
-	dbPath := filepath.Join(beadsDir, beads.CanonicalDatabaseName)
 
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	db, store, err := openStoreDB(beadsDir)
+	if err != nil {
 		return DoctorCheck{
 			Name:    "Child-Parent Dependencies",
 			Status:  "ok",
 			Message: "N/A (no database)",
 		}
 	}
-
-	db, err := openDBReadOnly(dbPath)
-	if err != nil {
-		return DoctorCheck{
-			Name:    "Child-Parent Dependencies",
-			Status:  "ok",
-			Message: "N/A (unable to open database)",
-		}
-	}
-	defer db.Close()
+	defer func() { _ = store.Close() }()
 
 	// Query for child→parent BLOCKING dependencies where issue_id starts with depends_on_id + "."
 	// Only matches blocking types (blocks, conditional-blocks, waits-for) that cause deadlock.
@@ -359,7 +346,7 @@ func CheckChildParentDependencies(path string) DoctorCheck {
 	query := `
 		SELECT d.issue_id, d.depends_on_id
 		FROM dependencies d
-		WHERE d.issue_id LIKE d.depends_on_id || '.%'
+		WHERE d.issue_id LIKE CONCAT(d.depends_on_id, '.%')
 		  AND d.type IN ('blocks', 'conditional-blocks', 'waits-for')
 	`
 	rows, err := db.Query(query)

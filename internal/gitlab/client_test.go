@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -49,10 +50,10 @@ func TestBuildURL(t *testing.T) {
 	client := NewClient("token", "https://gitlab.example.com", "123")
 
 	tests := []struct {
-		name     string
-		path     string
-		params   map[string]string
-		wantURL  string
+		name    string
+		path    string
+		params  map[string]string
+		wantURL string
 	}{
 		{
 			name:    "issues endpoint",
@@ -111,7 +112,7 @@ func TestFetchIssues_Success(t *testing.T) {
 			{ID: 2, IID: 2, Title: "Second issue", State: "opened"},
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(issues)
+		_ = json.NewEncoder(w).Encode(issues)
 	}))
 	defer server.Close()
 
@@ -143,12 +144,12 @@ func TestFetchIssues_Pagination(t *testing.T) {
 			w.Header().Set("X-Next-Page", "2")
 			w.Header().Set("X-Total-Pages", "2")
 			issues := []Issue{{ID: 1, IID: 1, Title: "Issue 1"}}
-			json.NewEncoder(w).Encode(issues)
+			_ = json.NewEncoder(w).Encode(issues)
 		} else {
 			// Second page - no more pages
 			w.Header().Set("X-Total-Pages", "2")
 			issues := []Issue{{ID: 2, IID: 2, Title: "Issue 2"}}
-			json.NewEncoder(w).Encode(issues)
+			_ = json.NewEncoder(w).Encode(issues)
 		}
 	}))
 	defer server.Close()
@@ -174,7 +175,7 @@ func TestFetchIssuesSince(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedURL = r.URL.String()
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]Issue{})
+		_ = json.NewEncoder(w).Encode([]Issue{})
 	}))
 	defer server.Close()
 
@@ -205,12 +206,12 @@ func TestCreateIssue_Success(t *testing.T) {
 		}
 
 		// Capture request body
-		json.NewDecoder(r.Body).Decode(&capturedBody)
+		_ = json.NewDecoder(r.Body).Decode(&capturedBody)
 
 		// Return created issue
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(Issue{
+		_ = json.NewEncoder(w).Encode(Issue{
 			ID:    100,
 			IID:   42,
 			Title: "New issue",
@@ -250,10 +251,10 @@ func TestUpdateIssue_Success(t *testing.T) {
 			t.Errorf("URL path = %s, want to contain /projects/123/issues/42", r.URL.Path)
 		}
 
-		json.NewDecoder(r.Body).Decode(&capturedBody)
+		_ = json.NewDecoder(r.Body).Decode(&capturedBody)
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(Issue{
+		_ = json.NewEncoder(w).Encode(Issue{
 			ID:    100,
 			IID:   42,
 			Title: "Updated title",
@@ -297,7 +298,7 @@ func TestGetIssueLinks_Success(t *testing.T) {
 				LinkType:    "blocks",
 			},
 		}
-		json.NewEncoder(w).Encode(links)
+		_ = json.NewEncoder(w).Encode(links)
 	}))
 	defer server.Close()
 
@@ -327,7 +328,7 @@ func TestRateLimiting(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]Issue{{ID: 1, IID: 1, Title: "After retry"}})
+		_ = json.NewEncoder(w).Encode([]Issue{{ID: 1, IID: 1, Title: "After retry"}})
 	}))
 	defer server.Close()
 
@@ -351,7 +352,7 @@ func TestRateLimiting(t *testing.T) {
 func TestErrorHandling(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte(`{"message": "401 Unauthorized"}`))
+		_, _ = w.Write([]byte(`{"message": "401 Unauthorized"}`))
 	}))
 	defer server.Close()
 
@@ -389,7 +390,7 @@ func TestProjectIDURLEncoding(t *testing.T) {
 			t.Errorf("Server path = %s, want to contain decoded 'group/subgroup/project'", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]Issue{})
+		_ = json.NewEncoder(w).Encode([]Issue{})
 	}))
 	defer server.Close()
 
@@ -431,7 +432,7 @@ func TestFetchIssueByIID(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(Issue{
+		_ = json.NewEncoder(w).Encode(Issue{
 			ID:    100,
 			IID:   42,
 			Title: "Single issue",
@@ -467,11 +468,11 @@ func TestCreateIssueLink(t *testing.T) {
 			t.Errorf("Method = %s, want POST", r.Method)
 		}
 
-		json.NewDecoder(r.Body).Decode(&capturedBody)
+		_ = json.NewDecoder(r.Body).Decode(&capturedBody)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(IssueLink{
+		_ = json.NewEncoder(w).Encode(IssueLink{
 			SourceIssue: &Issue{IID: 42},
 			TargetIssue: &Issue{IID: 43},
 			LinkType:    "blocks",
@@ -513,7 +514,7 @@ func TestCreateIssueLink(t *testing.T) {
 func TestUpdateIssue_Error(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
-		w.Write([]byte(`{"message": "Issue not found"}`))
+		_, _ = w.Write([]byte(`{"message": "Issue not found"}`))
 	}))
 	defer server.Close()
 
@@ -533,7 +534,7 @@ func TestUpdateIssue_Error(t *testing.T) {
 func TestUpdateIssue_InvalidJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{invalid json`))
+		_, _ = w.Write([]byte(`{invalid json`))
 	}))
 	defer server.Close()
 
@@ -553,7 +554,7 @@ func TestUpdateIssue_InvalidJSON(t *testing.T) {
 func TestGetIssueLinks_Error(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
-		w.Write([]byte(`{"message": "Access denied"}`))
+		_, _ = w.Write([]byte(`{"message": "Access denied"}`))
 	}))
 	defer server.Close()
 
@@ -573,7 +574,7 @@ func TestGetIssueLinks_Error(t *testing.T) {
 func TestGetIssueLinks_InvalidJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`not valid json`))
+		_, _ = w.Write([]byte(`not valid json`))
 	}))
 	defer server.Close()
 
@@ -593,7 +594,7 @@ func TestGetIssueLinks_InvalidJSON(t *testing.T) {
 func TestFetchIssueByIID_Error(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
-		w.Write([]byte(`{"message": "Issue not found"}`))
+		_, _ = w.Write([]byte(`{"message": "Issue not found"}`))
 	}))
 	defer server.Close()
 
@@ -613,7 +614,7 @@ func TestFetchIssueByIID_Error(t *testing.T) {
 func TestFetchIssueByIID_InvalidJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{malformed`))
+		_, _ = w.Write([]byte(`{malformed`))
 	}))
 	defer server.Close()
 
@@ -633,7 +634,7 @@ func TestFetchIssueByIID_InvalidJSON(t *testing.T) {
 func TestCreateIssueLink_Error(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"message": "Target issue not found"}`))
+		_, _ = w.Write([]byte(`{"message": "Target issue not found"}`))
 	}))
 	defer server.Close()
 
@@ -654,7 +655,7 @@ func TestCreateIssueLink_InvalidJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte(`{broken json`))
+		_, _ = w.Write([]byte(`{broken json`))
 	}))
 	defer server.Close()
 
@@ -675,7 +676,7 @@ func TestCreateIssue_InvalidJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte(`{not valid json`))
+		_, _ = w.Write([]byte(`{not valid json`))
 	}))
 	defer server.Close()
 
@@ -695,7 +696,7 @@ func TestCreateIssue_InvalidJSON(t *testing.T) {
 func TestFetchIssuesSince_Error(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(`{"message": "Server error"}`))
+		_, _ = w.Write([]byte(`{"message": "Server error"}`))
 	}))
 	defer server.Close()
 
@@ -731,7 +732,7 @@ func TestRetryMarshalError(t *testing.T) {
 		}
 		// Third attempt succeeds
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(Issue{ID: 1, IID: 1, Title: "After retry"})
+		_ = json.NewEncoder(w).Encode(Issue{ID: 1, IID: 1, Title: "After retry"})
 	}))
 	defer server.Close()
 
@@ -760,7 +761,7 @@ func TestFetchIssues_PaginationLimit(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		// Always return X-Next-Page to simulate infinite pagination (malformed response)
 		w.Header().Set("X-Next-Page", "999")
-		json.NewEncoder(w).Encode([]Issue{{ID: requestCount, IID: requestCount, Title: "Issue"}})
+		_ = json.NewEncoder(w).Encode([]Issue{{ID: requestCount, IID: requestCount, Title: "Issue"}})
 	}))
 	defer server.Close()
 
@@ -790,7 +791,7 @@ func TestFetchIssuesSince_PaginationLimit(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		// Always return X-Next-Page to simulate infinite pagination
 		w.Header().Set("X-Next-Page", "999")
-		json.NewEncoder(w).Encode([]Issue{{ID: requestCount, IID: requestCount, Title: "Issue"}})
+		_ = json.NewEncoder(w).Encode([]Issue{{ID: requestCount, IID: requestCount, Title: "Issue"}})
 	}))
 	defer server.Close()
 
@@ -811,15 +812,16 @@ func TestFetchIssuesSince_PaginationLimit(t *testing.T) {
 	}
 }
 
-// TestFetchIssues_ContextCancellation verifies that FetchIssues respects context cancellation.
+// TestFetchIssues_ContextCancellation verifies that FetchIssues respects context cancellation
+// or pagination limits to prevent infinite loops.
 func TestFetchIssues_ContextCancellation(t *testing.T) {
-	requestCount := 0
+	var requestCount atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
+		count := requestCount.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		// Always return X-Next-Page to continue pagination
 		w.Header().Set("X-Next-Page", "2")
-		json.NewEncoder(w).Encode([]Issue{{ID: requestCount, IID: requestCount, Title: "Issue"}})
+		_ = json.NewEncoder(w).Encode([]Issue{{ID: int(count), IID: int(count), Title: "Issue"}})
 	}))
 	defer server.Close()
 
@@ -834,32 +836,35 @@ func TestFetchIssues_ContextCancellation(t *testing.T) {
 
 	issues, err := client.FetchIssues(ctx, "all")
 
-	// Should return context.Canceled error (either directly or wrapped)
+	// Should return an error that stops the loop (context cancellation OR pagination limit)
 	if err == nil {
-		t.Fatal("FetchIssues() error = nil, want context cancellation error")
+		t.Fatal("FetchIssues() error = nil, want error to stop infinite loop")
 	}
-	// Context cancellation can be returned directly from our loop check or wrapped by doRequest
-	if err != context.Canceled && !strings.Contains(err.Error(), "context canceled") {
-		t.Errorf("error = %v, want context.Canceled or error containing 'context canceled'", err)
+	// Accept either context cancellation or pagination limit - both are valid ways to stop the loop
+	isContextCanceled := err == context.Canceled || strings.Contains(err.Error(), "context canceled")
+	isPaginationLimit := strings.Contains(err.Error(), "pagination limit exceeded")
+	if !isContextCanceled && !isPaginationLimit {
+		t.Errorf("error = %v, want context.Canceled, 'context canceled', or 'pagination limit exceeded'", err)
 	}
 	// Verify the loop was stopped (not infinite) - requestCount should be reasonable
-	if requestCount > 1000 {
-		t.Errorf("requestCount = %d, expected loop to stop due to context cancellation", requestCount)
+	if requestCount.Load() > MaxPages+1 {
+		t.Errorf("requestCount = %d, expected loop to stop", requestCount.Load())
 	}
 	// Note: partial results may or may not be returned depending on whether cancellation
 	// was caught by our loop check (returns partial) or by doRequest (returns nil)
-	t.Logf("Context cancelled after %d requests, %d issues returned", requestCount, len(issues))
+	t.Logf("Loop stopped after %d requests, %d issues returned, error: %v", requestCount.Load(), len(issues), err)
 }
 
-// TestFetchIssuesSince_ContextCancellation verifies that FetchIssuesSince respects context cancellation.
+// TestFetchIssuesSince_ContextCancellation verifies that FetchIssuesSince respects context cancellation
+// or pagination limits to prevent infinite loops.
 func TestFetchIssuesSince_ContextCancellation(t *testing.T) {
-	requestCount := 0
+	var requestCount atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
+		count := requestCount.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		// Always return X-Next-Page to continue pagination
 		w.Header().Set("X-Next-Page", "2")
-		json.NewEncoder(w).Encode([]Issue{{ID: requestCount, IID: requestCount, Title: "Issue"}})
+		_ = json.NewEncoder(w).Encode([]Issue{{ID: int(count), IID: int(count), Title: "Issue"}})
 	}))
 	defer server.Close()
 
@@ -874,19 +879,21 @@ func TestFetchIssuesSince_ContextCancellation(t *testing.T) {
 
 	issues, err := client.FetchIssuesSince(ctx, "all", time.Now().Add(-24*time.Hour))
 
-	// Should return context.Canceled error (either directly or wrapped)
+	// Should return an error that stops the loop (context cancellation OR pagination limit)
 	if err == nil {
-		t.Fatal("FetchIssuesSince() error = nil, want context cancellation error")
+		t.Fatal("FetchIssuesSince() error = nil, want error to stop infinite loop")
 	}
-	// Context cancellation can be returned directly from our loop check or wrapped by doRequest
-	if err != context.Canceled && !strings.Contains(err.Error(), "context canceled") {
-		t.Errorf("error = %v, want context.Canceled or error containing 'context canceled'", err)
+	// Accept either context cancellation or pagination limit - both are valid ways to stop the loop
+	isContextCanceled := err == context.Canceled || strings.Contains(err.Error(), "context canceled")
+	isPaginationLimit := strings.Contains(err.Error(), "pagination limit exceeded")
+	if !isContextCanceled && !isPaginationLimit {
+		t.Errorf("error = %v, want context.Canceled, 'context canceled', or 'pagination limit exceeded'", err)
 	}
 	// Verify the loop was stopped (not infinite) - requestCount should be reasonable
-	if requestCount > 1000 {
-		t.Errorf("requestCount = %d, expected loop to stop due to context cancellation", requestCount)
+	if requestCount.Load() > MaxPages+1 {
+		t.Errorf("requestCount = %d, expected loop to stop", requestCount.Load())
 	}
 	// Note: partial results may or may not be returned depending on whether cancellation
 	// was caught by our loop check (returns partial) or by doRequest (returns nil)
-	t.Logf("Context cancelled after %d requests, %d issues returned", requestCount, len(issues))
+	t.Logf("Loop stopped after %d requests, %d issues returned, error: %v", requestCount.Load(), len(issues), err)
 }

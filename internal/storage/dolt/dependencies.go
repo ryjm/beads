@@ -19,7 +19,57 @@ func (s *DoltStore) AddDependency(ctx context.Context, dep *types.Dependency, ac
 		metadata = "{}"
 	}
 
-	_, err := s.db.ExecContext(ctx, `
+	// Validate that the source issue exists
+	var issueExists int
+	if err := s.queryRowContext(ctx, func(row *sql.Row) error {
+		return row.Scan(&issueExists)
+	}, `SELECT COUNT(*) FROM issues WHERE id = ?`, dep.IssueID); err != nil {
+		return fmt.Errorf("failed to check issue existence: %w", err)
+	}
+	if issueExists == 0 {
+		return fmt.Errorf("issue %s not found", dep.IssueID)
+	}
+
+	// Validate that the target issue exists (skip for external cross-rig references)
+	if !strings.HasPrefix(dep.DependsOnID, "external:") {
+		var targetExists int
+		if err := s.queryRowContext(ctx, func(row *sql.Row) error {
+			return row.Scan(&targetExists)
+		}, `SELECT COUNT(*) FROM issues WHERE id = ?`, dep.DependsOnID); err != nil {
+			return fmt.Errorf("failed to check target issue existence: %w", err)
+		}
+		if targetExists == 0 {
+			return fmt.Errorf("issue %s not found", dep.DependsOnID)
+		}
+	}
+
+	// Cycle detection for blocking dependency types: check if adding this edge
+	// would create a cycle by seeing if depends_on_id can already reach issue_id.
+	if dep.Type == types.DepBlocks {
+		var reachable int
+		err := s.queryRowContext(ctx, func(row *sql.Row) error {
+			return row.Scan(&reachable)
+		}, `
+			WITH RECURSIVE reachable AS (
+				SELECT ? AS node, 0 AS depth
+				UNION ALL
+				SELECT d.depends_on_id, r.depth + 1
+				FROM reachable r
+				JOIN dependencies d ON d.issue_id = r.node
+				WHERE d.type = 'blocks'
+				  AND r.depth < 100
+			)
+			SELECT COUNT(*) FROM reachable WHERE node = ?
+		`, dep.DependsOnID, dep.IssueID)
+		if err != nil {
+			return fmt.Errorf("failed to check for dependency cycle: %w", err)
+		}
+		if reachable > 0 {
+			return fmt.Errorf("adding dependency would create a cycle")
+		}
+	}
+
+	_, err := s.execContext(ctx, `
 		INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id)
 		VALUES (?, ?, ?, NOW(), ?, ?, ?)
 		ON DUPLICATE KEY UPDATE type = VALUES(type), metadata = VALUES(metadata)
@@ -32,7 +82,7 @@ func (s *DoltStore) AddDependency(ctx context.Context, dep *types.Dependency, ac
 
 // RemoveDependency removes a dependency between two issues
 func (s *DoltStore) RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.execContext(ctx, `
 		DELETE FROM dependencies WHERE issue_id = ? AND depends_on_id = ?
 	`, issueID, dependsOnID)
 	if err != nil {
@@ -43,7 +93,7 @@ func (s *DoltStore) RemoveDependency(ctx context.Context, issueID, dependsOnID s
 
 // GetDependencies retrieves issues that this issue depends on
 func (s *DoltStore) GetDependencies(ctx context.Context, issueID string) ([]*types.Issue, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.queryContext(ctx, `
 		SELECT i.id FROM issues i
 		JOIN dependencies d ON i.id = d.depends_on_id
 		WHERE d.issue_id = ?
@@ -59,7 +109,7 @@ func (s *DoltStore) GetDependencies(ctx context.Context, issueID string) ([]*typ
 
 // GetDependents retrieves issues that depend on this issue
 func (s *DoltStore) GetDependents(ctx context.Context, issueID string) ([]*types.Issue, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.queryContext(ctx, `
 		SELECT i.id FROM issues i
 		JOIN dependencies d ON i.id = d.issue_id
 		WHERE d.depends_on_id = ?
@@ -75,7 +125,7 @@ func (s *DoltStore) GetDependents(ctx context.Context, issueID string) ([]*types
 
 // GetDependenciesWithMetadata returns dependencies with metadata
 func (s *DoltStore) GetDependenciesWithMetadata(ctx context.Context, issueID string) ([]*types.IssueWithDependencyMetadata, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.queryContext(ctx, `
 		SELECT d.depends_on_id, d.type, d.created_at, d.created_by, d.metadata, d.thread_id
 		FROM dependencies d
 		WHERE d.issue_id = ?
@@ -83,38 +133,65 @@ func (s *DoltStore) GetDependenciesWithMetadata(ctx context.Context, issueID str
 	if err != nil {
 		return nil, fmt.Errorf("failed to get dependencies with metadata: %w", err)
 	}
-	defer rows.Close()
 
-	var results []*types.IssueWithDependencyMetadata
+	// Collect dep metadata first, then close rows before fetching issues.
+	// This avoids connection pool deadlock when MaxOpenConns=1 (embedded dolt).
+	type depMeta struct {
+		depID, depType string
+	}
+	var deps []depMeta
 	for rows.Next() {
 		var depID, depType, createdBy string
 		var createdAt sql.NullTime
 		var metadata, threadID sql.NullString
 
 		if err := rows.Scan(&depID, &depType, &createdAt, &createdBy, &metadata, &threadID); err != nil {
+			_ = rows.Close() // Best effort cleanup on error path
 			return nil, fmt.Errorf("failed to scan dependency: %w", err)
 		}
+		deps = append(deps, depMeta{depID: depID, depType: depType})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close() // Best effort cleanup on error path
+		return nil, err
+	}
+	_ = rows.Close() // Redundant close for safety (rows already iterated)
 
-		issue, err := s.GetIssue(ctx, depID)
-		if err != nil {
-			return nil, err
-		}
-		if issue == nil {
+	if len(deps) == 0 {
+		return nil, nil
+	}
+
+	// Batch-fetch all issues after rows are closed (connection released)
+	ids := make([]string, len(deps))
+	for i, d := range deps {
+		ids[i] = d.depID
+	}
+	issues, err := s.GetIssuesByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	issueMap := make(map[string]*types.Issue, len(issues))
+	for _, iss := range issues {
+		issueMap[iss.ID] = iss
+	}
+
+	var results []*types.IssueWithDependencyMetadata
+	for _, d := range deps {
+		issue, ok := issueMap[d.depID]
+		if !ok {
 			continue
 		}
-
-		result := &types.IssueWithDependencyMetadata{
+		results = append(results, &types.IssueWithDependencyMetadata{
 			Issue:          *issue,
-			DependencyType: types.DependencyType(depType),
-		}
-		results = append(results, result)
+			DependencyType: types.DependencyType(d.depType),
+		})
 	}
-	return results, rows.Err()
+	return results, nil
 }
 
 // GetDependentsWithMetadata returns dependents with metadata
 func (s *DoltStore) GetDependentsWithMetadata(ctx context.Context, issueID string) ([]*types.IssueWithDependencyMetadata, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.queryContext(ctx, `
 		SELECT d.issue_id, d.type, d.created_at, d.created_by, d.metadata, d.thread_id
 		FROM dependencies d
 		WHERE d.depends_on_id = ?
@@ -122,38 +199,65 @@ func (s *DoltStore) GetDependentsWithMetadata(ctx context.Context, issueID strin
 	if err != nil {
 		return nil, fmt.Errorf("failed to get dependents with metadata: %w", err)
 	}
-	defer rows.Close()
 
-	var results []*types.IssueWithDependencyMetadata
+	// Collect dep metadata first, then close rows before fetching issues.
+	// This avoids connection pool deadlock when MaxOpenConns=1 (embedded dolt).
+	type depMeta struct {
+		depID, depType string
+	}
+	var deps []depMeta
 	for rows.Next() {
 		var depID, depType, createdBy string
 		var createdAt sql.NullTime
 		var metadata, threadID sql.NullString
 
 		if err := rows.Scan(&depID, &depType, &createdAt, &createdBy, &metadata, &threadID); err != nil {
+			_ = rows.Close() // Best effort cleanup on error path
 			return nil, fmt.Errorf("failed to scan dependent: %w", err)
 		}
+		deps = append(deps, depMeta{depID: depID, depType: depType})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close() // Best effort cleanup on error path
+		return nil, err
+	}
+	_ = rows.Close() // Redundant close for safety (rows already iterated)
 
-		issue, err := s.GetIssue(ctx, depID)
-		if err != nil {
-			return nil, err
-		}
-		if issue == nil {
+	if len(deps) == 0 {
+		return nil, nil
+	}
+
+	// Batch-fetch all issues after rows are closed (connection released)
+	ids := make([]string, len(deps))
+	for i, d := range deps {
+		ids[i] = d.depID
+	}
+	issues, err := s.GetIssuesByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	issueMap := make(map[string]*types.Issue, len(issues))
+	for _, iss := range issues {
+		issueMap[iss.ID] = iss
+	}
+
+	var results []*types.IssueWithDependencyMetadata
+	for _, d := range deps {
+		issue, ok := issueMap[d.depID]
+		if !ok {
 			continue
 		}
-
-		result := &types.IssueWithDependencyMetadata{
+		results = append(results, &types.IssueWithDependencyMetadata{
 			Issue:          *issue,
-			DependencyType: types.DependencyType(depType),
-		}
-		results = append(results, result)
+			DependencyType: types.DependencyType(d.depType),
+		})
 	}
-	return results, rows.Err()
+	return results, nil
 }
 
 // GetDependencyRecords returns raw dependency records for an issue
 func (s *DoltStore) GetDependencyRecords(ctx context.Context, issueID string) ([]*types.Dependency, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.queryContext(ctx, `
 		SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
 		FROM dependencies
 		WHERE issue_id = ?
@@ -168,7 +272,7 @@ func (s *DoltStore) GetDependencyRecords(ctx context.Context, issueID string) ([
 
 // GetAllDependencyRecords returns all dependency records
 func (s *DoltStore) GetAllDependencyRecords(ctx context.Context) (map[string][]*types.Dependency, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.queryContext(ctx, `
 		SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
 		FROM dependencies
 		ORDER BY issue_id
@@ -211,7 +315,7 @@ func (s *DoltStore) GetDependencyRecordsForIssues(ctx context.Context, issueIDs 
 		ORDER BY issue_id
 	`, inClause)
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get dependency records for issues: %w", err)
 	}
@@ -251,7 +355,7 @@ func (s *DoltStore) GetDependencyCounts(ctx context.Context, issueIDs []string) 
 		GROUP BY issue_id
 	`, inClause)
 
-	depRows, err := s.db.QueryContext(ctx, depQuery, args...)
+	depRows, err := s.queryContext(ctx, depQuery, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get dependency counts: %w", err)
 	}
@@ -282,7 +386,7 @@ func (s *DoltStore) GetDependencyCounts(ctx context.Context, issueIDs []string) 
 		GROUP BY depends_on_id
 	`, inClause)
 
-	blockingRows, err := s.db.QueryContext(ctx, blockingQuery, args...)
+	blockingRows, err := s.queryContext(ctx, blockingQuery, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get blocking counts: %w", err)
 	}
@@ -328,7 +432,7 @@ func (s *DoltStore) buildDependencyTree(ctx context.Context, issueID string, dep
 		query = "SELECT depends_on_id FROM dependencies WHERE issue_id = ?"
 	}
 
-	rows, err := s.db.QueryContext(ctx, query, issueID)
+	rows, err := s.queryContext(ctx, query, issueID)
 	if err != nil {
 		return nil, err
 	}
@@ -408,7 +512,7 @@ func (s *DoltStore) DetectCycles(ctx context.Context) ([][]*types.Issue, error) 
 					cyclePath := path[cycleStart:]
 					var cycleIssues []*types.Issue
 					for _, id := range cyclePath {
-						issue, _ := s.GetIssue(ctx, id)
+						issue, _ := s.GetIssue(ctx, id) // Best effort: nil issue handled by caller
 						if issue != nil {
 							cycleIssues = append(cycleIssues, issue)
 						}
@@ -436,7 +540,7 @@ func (s *DoltStore) DetectCycles(ctx context.Context) ([][]*types.Issue, error) 
 
 // IsBlocked checks if an issue has open blockers
 func (s *DoltStore) IsBlocked(ctx context.Context, issueID string) (bool, []string, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.queryContext(ctx, `
 		SELECT d.depends_on_id
 		FROM dependencies d
 		JOIN issues i ON d.depends_on_id = i.id
@@ -464,7 +568,7 @@ func (s *DoltStore) IsBlocked(ctx context.Context, issueID string) (bool, []stri
 // GetNewlyUnblockedByClose finds issues that become unblocked when an issue is closed
 func (s *DoltStore) GetNewlyUnblockedByClose(ctx context.Context, closedIssueID string) ([]*types.Issue, error) {
 	// Find issues that were blocked only by the closed issue
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.queryContext(ctx, `
 		SELECT DISTINCT d.issue_id
 		FROM dependencies d
 		JOIN issues i ON d.issue_id = i.id
@@ -504,6 +608,13 @@ func (s *DoltStore) scanIssueIDs(ctx context.Context, rows *sql.Rows) ([]*types.
 		return nil, err
 	}
 
+	// Close rows before the nested GetIssuesByIDs query.
+	// MySQL server mode (go-sql-driver/mysql) can't handle multiple active
+	// result sets on one connection - the first must be closed before starting
+	// a new query, otherwise "driver: bad connection" errors occur.
+	// Closing here is safe because sql.Rows.Close() is idempotent.
+	_ = rows.Close() // Redundant close for safety (rows already iterated)
+
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -532,8 +643,7 @@ func (s *DoltStore) GetIssuesByIDs(ctx context.Context, ids []string) ([]*types.
 		       status, priority, issue_type, assignee, estimated_minutes,
 		       created_at, created_by, owner, updated_at, closed_at, external_ref,
 		       compaction_level, compacted_at, compacted_at_commit, original_size, source_repo, close_reason,
-		       deleted_at, deleted_by, delete_reason, original_type,
-		       sender, ephemeral, pinned, is_template, crystallizes,
+		       sender, ephemeral, wisp_type, pinned, is_template, crystallizes,
 		       await_type, await_id, timeout_ns, waiters,
 		       hook_bead, role_bead, agent_state, last_activity, role_type, rig, mol_type,
 		       event_kind, actor, target, payload,
@@ -543,7 +653,7 @@ func (s *DoltStore) GetIssuesByIDs(ctx context.Context, ids []string) ([]*types.
 		WHERE id IN (%s)
 	`, strings.Join(placeholders, ","))
 
-	queryRows, err := s.db.QueryContext(ctx, query, args...)
+	queryRows, err := s.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get issues by IDs: %w", err)
 	}
@@ -565,12 +675,12 @@ func (s *DoltStore) GetIssuesByIDs(ctx context.Context, ids []string) ([]*types.
 func scanIssueRow(rows *sql.Rows) (*types.Issue, error) {
 	var issue types.Issue
 	var createdAtStr, updatedAtStr sql.NullString // TEXT columns - must parse manually
-	var closedAt, compactedAt, deletedAt, lastActivity, dueAt, deferUntil sql.NullTime
+	var closedAt, compactedAt, lastActivity, dueAt, deferUntil sql.NullTime
 	var estimatedMinutes, originalSize, timeoutNs sql.NullInt64
 	var assignee, externalRef, compactedAtCommit, owner sql.NullString
-	var contentHash, sourceRepo, closeReason, deletedBy, deleteReason, originalType sql.NullString
+	var contentHash, sourceRepo, closeReason sql.NullString
 	var workType, sourceSystem sql.NullString
-	var sender, molType, eventKind, actor, target, payload sql.NullString
+	var sender, wispType, molType, eventKind, actor, target, payload sql.NullString
 	var awaitType, awaitID, waiters sql.NullString
 	var hookBead, roleBead, agentState, roleType, rig sql.NullString
 	var ephemeral, pinned, isTemplate, crystallizes sql.NullInt64
@@ -582,8 +692,7 @@ func scanIssueRow(rows *sql.Rows) (*types.Issue, error) {
 		&issue.Priority, &issue.IssueType, &assignee, &estimatedMinutes,
 		&createdAtStr, &issue.CreatedBy, &owner, &updatedAtStr, &closedAt, &externalRef,
 		&issue.CompactionLevel, &compactedAt, &compactedAtCommit, &originalSize, &sourceRepo, &closeReason,
-		&deletedAt, &deletedBy, &deleteReason, &originalType,
-		&sender, &ephemeral, &pinned, &isTemplate, &crystallizes,
+		&sender, &ephemeral, &wispType, &pinned, &isTemplate, &crystallizes,
 		&awaitType, &awaitID, &timeoutNs, &waiters,
 		&hookBead, &roleBead, &agentState, &lastActivity, &roleType, &rig, &molType,
 		&eventKind, &actor, &target, &payload,
@@ -636,23 +745,14 @@ func scanIssueRow(rows *sql.Rows) (*types.Issue, error) {
 	if closeReason.Valid {
 		issue.CloseReason = closeReason.String
 	}
-	if deletedAt.Valid {
-		issue.DeletedAt = &deletedAt.Time
-	}
-	if deletedBy.Valid {
-		issue.DeletedBy = deletedBy.String
-	}
-	if deleteReason.Valid {
-		issue.DeleteReason = deleteReason.String
-	}
-	if originalType.Valid {
-		issue.OriginalType = originalType.String
-	}
 	if sender.Valid {
 		issue.Sender = sender.String
 	}
 	if ephemeral.Valid && ephemeral.Int64 != 0 {
 		issue.Ephemeral = true
+	}
+	if wispType.Valid {
+		issue.WispType = types.WispType(wispType.String)
 	}
 	if pinned.Valid && pinned.Int64 != 0 {
 		issue.Pinned = true
@@ -751,6 +851,9 @@ func scanDependencyRow(rows *sql.Rows) (*types.Dependency, error) {
 
 	if createdAt.Valid {
 		dep.CreatedAt = createdAt.Time
+	}
+	if metadata.Valid {
+		dep.Metadata = metadata.String
 	}
 	if threadID.Valid {
 		dep.ThreadID = threadID.String

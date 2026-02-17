@@ -4,19 +4,18 @@ import (
 	"bufio"
 	"cmp"
 	"context"
-	"database/sql"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
-	"github.com/steveyegge/beads/internal/syncbranch"
+	"github.com/steveyegge/beads/internal/git"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -66,13 +65,20 @@ NOTE: This is a rare operation. Most users never need this command.`,
 
 		ctx := rootCtx
 
-		// rename-prefix requires direct mode (not supported by daemon)
-		if daemonClient != nil {
-			if err := ensureDirectMode("daemon does not support rename-prefix command"); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		} else if store == nil {
+		// Block rename-prefix in worktrees (same guard as init.go:168-186)
+		if isGitRepo() && git.IsWorktree() {
+			mainRepoRoot, _ := git.GetMainRepoRoot()
+			fmt.Fprintf(os.Stderr, "Error: cannot run 'bd rename-prefix' from a git worktree\n\n")
+			fmt.Fprintf(os.Stderr, "Worktrees share the .beads database from the main repository,\n")
+			fmt.Fprintf(os.Stderr, "but JSONL export targets the main worktree's file.\n\n")
+			fmt.Fprintf(os.Stderr, "Run this command from the main repository instead:\n")
+			fmt.Fprintf(os.Stderr, "  cd %s\n", mainRepoRoot)
+			fmt.Fprintf(os.Stderr, "  bd rename-prefix %s\n", newPrefix)
+			os.Exit(1)
+		}
+
+		// rename-prefix requires direct database access
+		if store == nil {
 			if err := ensureStoreActive(); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
@@ -87,18 +93,7 @@ NOTE: This is a rare operation. Most users never need this command.`,
 		// Get JSONL path for sync operations
 		jsonlPath := findJSONLPath()
 
-		// If sync-branch is configured, pull latest remote issues first
-		// This ensures we have all issues from remote before renaming
-		if !dryRun && syncbranch.IsConfigured() {
-			silentLog := newSilentLogger()
-			pulled, err := syncBranchPull(ctx, store, silentLog)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to pull sync-branch: %v\n", err)
-				fmt.Fprintf(os.Stderr, "Continue anyway? Issues from remote may be missing.\n")
-			} else if pulled {
-				fmt.Printf("Pulled latest issues from sync-branch\n")
-			}
-		}
+		// Sync-branch operations are handled by bd sync.
 
 		// Force import from JSONL to ensure DB has all issues before rename
 		// This prevents data loss if JSONL has issues from other workspaces
@@ -188,7 +183,7 @@ NOTE: This is a rare operation. Most users never need this command.`,
 		}
 
 		if dryRun {
-				fmt.Printf("DRY RUN: Would rename %d issues from prefix '%s' to '%s'\n\n", len(issues), oldPrefix, newPrefix)
+			fmt.Printf("DRY RUN: Would rename %d issues from prefix '%s' to '%s'\n\n", len(issues), oldPrefix, newPrefix)
 			fmt.Printf("Sample changes:\n")
 			for i, issue := range issues {
 				if i >= 5 {
@@ -202,7 +197,6 @@ NOTE: This is a rare operation. Most users never need this command.`,
 			return
 		}
 
-
 		fmt.Printf("Renaming %d issues from prefix '%s' to '%s'...\n", len(issues), oldPrefix, newPrefix)
 
 		if err := renamePrefixInDB(ctx, oldPrefix, newPrefix, issues); err != nil {
@@ -214,31 +208,17 @@ NOTE: This is a rare operation. Most users never need this command.`,
 		// Safe because we imported all JSONL issues before rename
 		if jsonlPath != "" {
 			// Clear metadata hashes so integrity check doesn't fail
-			_ = store.SetMetadata(ctx, "jsonl_content_hash", "")
-			_ = store.SetMetadata(ctx, "export_hashes", "")
-			_ = store.SetJSONLFileHash(ctx, "")
+			_ = store.SetMetadata(ctx, "jsonl_content_hash", "") // Best effort: stale hashes will be recomputed on next export
+			_ = store.SetMetadata(ctx, "export_hashes", "")      // Best effort: stale hashes will be recomputed on next export
 
-			// Get all renamed issues from DB and export directly
-			renamedIssues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to get issues for export: %v\n", err)
+			// Export renamed issues directly to JSONL
+			if err := exportToJSONLWithStore(ctx, store, jsonlPath); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to export: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Run 'bd export --force' to update JSONL\n")
 			} else {
-				// Get dependencies for each issue
-				for _, issue := range renamedIssues {
-					deps, _ := store.GetDependencyRecords(ctx, issue.ID)
-					issue.Dependencies = deps
-				}
-				// Write directly to JSONL
-				if _, err := writeJSONLAtomic(jsonlPath, renamedIssues); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to export: %v\n", err)
-					fmt.Fprintf(os.Stderr, "Run 'bd export --force' to update JSONL\n")
-				} else {
-					fmt.Printf("Updated %s with new IDs\n", jsonlPath)
-				}
+				fmt.Printf("Updated %s with new IDs\n", jsonlPath)
 			}
 		}
-		// Also schedule for flush manager if available
-		markDirtyAndScheduleFullExport()
 
 		fmt.Printf("%s Successfully renamed prefix from %s to %s\n", ui.RenderPass("✓"), ui.RenderAccent(oldPrefix), ui.RenderAccent(newPrefix))
 
@@ -250,7 +230,7 @@ NOTE: This is a rare operation. Most users never need this command.`,
 			}
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
-			_ = enc.Encode(result)
+			_ = enc.Encode(result) // Best effort: JSON encoding of simple struct does not fail in practice
 		}
 	},
 }
@@ -296,7 +276,7 @@ type issueSort struct {
 // repairPrefixes consolidates multiple prefixes into a single target prefix
 // Issues with the correct prefix are left unchanged.
 // Issues with incorrect prefixes get new hash-based IDs.
-func repairPrefixes(ctx context.Context, st storage.Storage, actorName string, targetPrefix string, issues []*types.Issue, prefixes map[string]int, dryRun bool) error {
+func repairPrefixes(ctx context.Context, st *dolt.DoltStore, actorName string, targetPrefix string, issues []*types.Issue, prefixes map[string]int, dryRun bool) error {
 
 	// Separate issues into correct and incorrect prefix groups
 	var correctIssues []*types.Issue
@@ -325,13 +305,6 @@ func repairPrefixes(ctx context.Context, st storage.Storage, actorName string, t
 		)
 	})
 
-	// Get a database connection for ID generation
-	conn, err := st.UnderlyingConn(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get database connection: %w", err)
-	}
-	defer func() { _ = conn.Close() }()
-
 	// Build a map of all renames for text replacement using hash IDs
 	// Track used IDs to avoid collisions within the batch
 	renameMap := make(map[string]string)
@@ -344,7 +317,7 @@ func repairPrefixes(ctx context.Context, st storage.Storage, actorName string, t
 
 	// Generate hash IDs for all incorrect issues
 	for _, is := range incorrectIssues {
-		newID, err := generateRepairHashID(ctx, conn, targetPrefix, is.issue, actorName, usedIDs)
+		newID, err := generateRepairHashID(targetPrefix, is.issue, actorName, usedIDs)
 		if err != nil {
 			return fmt.Errorf("failed to generate hash ID for %s: %w", is.issue.ID, err)
 		}
@@ -443,31 +416,17 @@ func repairPrefixes(ctx context.Context, st storage.Storage, actorName string, t
 	jsonlPath := findJSONLPath()
 	if jsonlPath != "" {
 		// Clear metadata hashes so integrity check doesn't fail
-		_ = st.SetMetadata(ctx, "jsonl_content_hash", "")
-		_ = st.SetMetadata(ctx, "export_hashes", "")
-		_ = st.SetJSONLFileHash(ctx, "")
+		_ = st.SetMetadata(ctx, "jsonl_content_hash", "") // Best effort: stale hashes will be recomputed on next export
+		_ = st.SetMetadata(ctx, "export_hashes", "")      // Best effort: stale hashes will be recomputed on next export
 
-		// Get all renamed issues from DB and export directly
-		renamedIssues, err := st.SearchIssues(ctx, "", types.IssueFilter{})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to get issues for export: %v\n", err)
+		// Export renamed issues directly to JSONL
+		if err := exportToJSONLWithStore(ctx, st, jsonlPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to export: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Run 'bd export --force' to update JSONL\n")
 		} else {
-			// Get dependencies for each issue
-			for _, issue := range renamedIssues {
-				deps, _ := st.GetDependencyRecords(ctx, issue.ID)
-				issue.Dependencies = deps
-			}
-			// Write directly to JSONL
-			if _, err := writeJSONLAtomic(jsonlPath, renamedIssues); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to export: %v\n", err)
-				fmt.Fprintf(os.Stderr, "Run 'bd export --force' to update JSONL\n")
-			} else {
-				fmt.Printf("Updated %s with new IDs\n", jsonlPath)
-			}
+			fmt.Printf("Updated %s with new IDs\n", jsonlPath)
 		}
 	}
-	// Also schedule for flush manager if available
-	markDirtyAndScheduleFullExport()
 
 	fmt.Printf("\n%s Successfully consolidated %d prefixes into %s\n",
 		ui.RenderPass("✓"), len(prefixes), ui.RenderAccent(targetPrefix))
@@ -539,28 +498,36 @@ func renamePrefixInDB(ctx context.Context, oldPrefix, newPrefix string, issues [
 	return nil
 }
 
-// generateRepairHashID generates a hash-based ID for an issue during repair
-// Uses the sqlite.GenerateIssueID function but also checks usedIDs for batch collision avoidance
-func generateRepairHashID(ctx context.Context, conn *sql.Conn, prefix string, issue *types.Issue, actor string, usedIDs map[string]bool) (string, error) {
-	// Try to generate a unique ID using the standard generation function
-	// This handles collision detection against existing database IDs
-	newID, err := sqlite.GenerateIssueID(ctx, conn, prefix, issue, actor)
-	if err != nil {
-		return "", err
-	}
+// generateRepairHashID generates a hash-based ID for an issue during repair.
+// Uses content hashing and checks usedIDs for batch collision avoidance.
+func generateRepairHashID(prefix string, issue *types.Issue, actor string, usedIDs map[string]bool) (string, error) {
+	// Generate a hash ID from issue content (same approach as generateHashIDForIssue)
+	content := fmt.Sprintf("%s|%s|%s|%d|%d",
+		issue.Title,
+		issue.Description,
+		actor,
+		issue.CreatedAt.UnixNano(),
+		0, // nonce
+	)
+	h := sha256.Sum256([]byte(content))
+	shortHash := hex.EncodeToString(h[:4]) // 4 bytes = 8 hex chars
+	newID := fmt.Sprintf("%s-%s", prefix, shortHash)
 
 	// Check if this ID was already used in this batch
-	// If so, we need to generate a new one with a different timestamp
+	// If so, we need to generate a new one with a different nonce
 	attempts := 0
 	for usedIDs[newID] && attempts < 100 {
-		// Slightly modify the creation time to get a different hash
-		modifiedIssue := *issue
-		modifiedIssue.CreatedAt = issue.CreatedAt.Add(time.Duration(attempts+1) * time.Nanosecond)
-		newID, err = sqlite.GenerateIssueID(ctx, conn, prefix, &modifiedIssue, actor)
-		if err != nil {
-			return "", err
-		}
 		attempts++
+		content = fmt.Sprintf("%s|%s|%s|%d|%d",
+			issue.Title,
+			issue.Description,
+			actor,
+			issue.CreatedAt.UnixNano(),
+			attempts,
+		)
+		h = sha256.Sum256([]byte(content))
+		shortHash = hex.EncodeToString(h[:4])
+		newID = fmt.Sprintf("%s-%s", prefix, shortHash)
 	}
 
 	if usedIDs[newID] {

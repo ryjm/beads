@@ -438,11 +438,11 @@ func runWorktreeInfo(cmd *cobra.Command, args []string) error {
 
 	if jsonOutput {
 		result := map[string]interface{}{
-			"is_worktree":     true,
-			"path":            cwd,
-			"name":            filepath.Base(cwd),
-			"branch":          branch,
-			"main_repo":       mainRepoRoot,
+			"is_worktree":      true,
+			"path":             cwd,
+			"name":             filepath.Base(cwd),
+			"branch":           branch,
+			"main_repo":        mainRepoRoot,
 			"beads_redirected": redirectInfo.IsRedirected,
 		}
 		if redirectInfo.IsRedirected {
@@ -593,10 +593,9 @@ func getRedirectTarget(worktreePath string) string {
 		return ""
 	}
 	target := strings.TrimSpace(string(data))
-	// Resolve relative paths
+	// Resolve relative paths from the worktree root (matching FollowRedirect behavior)
 	if !filepath.IsAbs(target) {
-		beadsDir := filepath.Join(worktreePath, ".beads")
-		target = filepath.Join(beadsDir, target)
+		target = filepath.Join(worktreePath, target)
 	}
 	target, _ = filepath.Abs(target)
 	return target

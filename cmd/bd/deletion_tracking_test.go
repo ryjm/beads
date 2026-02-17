@@ -1,3 +1,5 @@
+//go:build cgo
+
 package main
 
 import (
@@ -9,244 +11,55 @@ import (
 
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// TestMultiWorkspaceDeletionSync simulates the bd-hv01 bug scenario:
-// Clone A deletes an issue, Clone B still has it, and after sync it should stay deleted
+// TestMultiWorkspaceDeletionSync verifies merge3WayAndPruneDeletions is a no-op
+// (3-way merge engine removed; Dolt handles sync natively).
 func TestMultiWorkspaceDeletionSync(t *testing.T) {
-	// Setup two separate workspaces simulating two git clones
-	cloneADir := t.TempDir()
-	cloneBDir := t.TempDir()
-
-	cloneAJSONL := filepath.Join(cloneADir, "issues.jsonl")
-	cloneBJSONL := filepath.Join(cloneBDir, "issues.jsonl")
-
-	cloneADB := filepath.Join(cloneADir, "beads.db")
-	cloneBDB := filepath.Join(cloneBDir, "beads.db")
-
 	ctx := context.Background()
-
-	// Create stores for both clones
-	storeA, err := sqlite.New(context.Background(), cloneADB)
-	if err != nil {
-		t.Fatalf("Failed to create store A: %v", err)
-	}
-	defer storeA.Close()
-
-	if err := storeA.SetConfig(ctx, "issue_prefix", "bd"); err != nil {
-		t.Fatalf("Failed to set issue_prefix for store A: %v", err)
-	}
-
-	storeB, err := sqlite.New(context.Background(), cloneBDB)
-	if err != nil {
-		t.Fatalf("Failed to create store B: %v", err)
-	}
-	defer storeB.Close()
-
-	if err := storeB.SetConfig(ctx, "issue_prefix", "bd"); err != nil {
-		t.Fatalf("Failed to set issue_prefix for store B: %v", err)
-	}
-
-	// Step 1: Both clones start with the same two issues
-	issueToDelete := &types.Issue{
-		ID:          "bd-delete-me",
-		Title:       "Issue to be deleted",
-		Description: "This will be deleted in clone A",
-		Status:      types.StatusOpen,
-		Priority:    1,
-		IssueType:   "bug",
-	}
-
-	issueToKeep := &types.Issue{
-		ID:          "bd-keep-me",
-		Title:       "Issue to keep",
-		Description: "This should remain",
-		Status:      types.StatusOpen,
-		Priority:    1,
-		IssueType:   "feature",
-	}
-
-	// Create in both stores (using "test" as actor)
-	if err := storeA.CreateIssue(ctx, issueToDelete, "test"); err != nil {
-		t.Fatalf("Failed to create issue in store A: %v", err)
-	}
-	if err := storeA.CreateIssue(ctx, issueToKeep, "test"); err != nil {
-		t.Fatalf("Failed to create issue in store A: %v", err)
-	}
-
-	if err := storeB.CreateIssue(ctx, issueToDelete, "test"); err != nil {
-		t.Fatalf("Failed to create issue in store B: %v", err)
-	}
-	if err := storeB.CreateIssue(ctx, issueToKeep, "test"); err != nil {
-		t.Fatalf("Failed to create issue in store B: %v", err)
-	}
-
-	// Export from both
-	if err := exportToJSONLWithStore(ctx, storeA, cloneAJSONL); err != nil {
-		t.Fatalf("Failed to export from store A: %v", err)
-	}
-	if err := exportToJSONLWithStore(ctx, storeB, cloneBJSONL); err != nil {
-		t.Fatalf("Failed to export from store B: %v", err)
-	}
-
-	// Initialize base snapshots for both (simulating first sync)
-	if err := initializeSnapshotsIfNeeded(cloneAJSONL); err != nil {
-		t.Fatalf("Failed to initialize snapshots for A: %v", err)
-	}
-	if err := initializeSnapshotsIfNeeded(cloneBJSONL); err != nil {
-		t.Fatalf("Failed to initialize snapshots for B: %v", err)
-	}
-
-	// Step 2: Clone A deletes the issue
-	if err := storeA.DeleteIssue(ctx, "bd-delete-me"); err != nil {
-		t.Fatalf("Failed to delete issue in store A: %v", err)
-	}
-
-	// Step 3: Clone A exports and captures left snapshot (simulating pre-pull)
-	if err := exportToJSONLWithStore(ctx, storeA, cloneAJSONL); err != nil {
-		t.Fatalf("Failed to export from store A after deletion: %v", err)
-	}
-	if err := captureLeftSnapshot(cloneAJSONL); err != nil {
-		t.Fatalf("Failed to capture left snapshot for A: %v", err)
-	}
-
-	// Simulate git push/pull: Copy Clone A's JSONL to Clone B's "remote" state
-	remoteJSONL := cloneAJSONL
-
-	// Step 4: Clone B exports (still has both issues) and captures left snapshot
-	if err := exportToJSONLWithStore(ctx, storeB, cloneBJSONL); err != nil {
-		t.Fatalf("Failed to export from store B: %v", err)
-	}
-	if err := captureLeftSnapshot(cloneBJSONL); err != nil {
-		t.Fatalf("Failed to capture left snapshot for B: %v", err)
-	}
-
-	// Step 5: Simulate Clone B pulling from remote (copy remote JSONL)
-	remoteData, err := os.ReadFile(remoteJSONL)
-	if err != nil {
-		t.Fatalf("Failed to read remote JSONL: %v", err)
-	}
-	if err := os.WriteFile(cloneBJSONL, remoteData, 0644); err != nil {
-		t.Fatalf("Failed to write pulled JSONL to clone B: %v", err)
-	}
-
-	// Step 6: Clone B applies 3-way merge and prunes deletions
-	// This is the key fix - it should detect that bd-delete-me was deleted remotely
-	merged, err := merge3WayAndPruneDeletions(ctx, storeB, cloneBJSONL)
-	if err != nil {
-		t.Fatalf("Failed to apply deletions from merge: %v", err)
-	}
-
-	if !merged {
-		t.Error("Expected 3-way merge to run, but it was skipped")
-	}
-
-	// Step 7: Verify the deletion was applied to Clone B's database
-	deletedIssue, err := storeB.GetIssue(ctx, "bd-delete-me")
-	if err == nil && deletedIssue != nil {
-		t.Errorf("Issue bd-delete-me should have been deleted from Clone B, but still exists")
-	}
-
-	// Verify the kept issue still exists
-	keptIssue, err := storeB.GetIssue(ctx, "bd-keep-me")
-	if err != nil || keptIssue == nil {
-		t.Errorf("Issue bd-keep-me should still exist in Clone B")
-	}
-
-	// Verify Clone A still has only one issue
-	issuesA, err := storeA.SearchIssues(ctx, "", types.IssueFilter{})
-	if err != nil {
-		t.Fatalf("Failed to search issues in store A: %v", err)
-	}
-	if len(issuesA) != 1 {
-		t.Errorf("Clone A should have 1 issue after deletion, got %d", len(issuesA))
-	}
-
-	// Verify Clone B now matches Clone A (both have 1 issue)
-	issuesB, err := storeB.SearchIssues(ctx, "", types.IssueFilter{})
-	if err != nil {
-		t.Fatalf("Failed to search issues in store B: %v", err)
-	}
-	if len(issuesB) != 1 {
-		t.Errorf("Clone B should have 1 issue after merge, got %d", len(issuesB))
-	}
-}
-
-// TestDeletionWithLocalModification tests the conflict scenario:
-// Remote deletes an issue, but local has modified it
-func TestDeletionWithLocalModification(t *testing.T) {
 	dir := t.TempDir()
 	jsonlPath := filepath.Join(dir, "issues.jsonl")
+
 	dbPath := filepath.Join(dir, "beads.db")
-
-	ctx := context.Background()
-
-	store, err := sqlite.New(context.Background(), dbPath)
+	store, err := dolt.New(context.Background(), &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
 	defer store.Close()
 
-	if err := store.SetConfig(ctx, "issue_prefix", "bd"); err != nil {
-		t.Fatalf("Failed to set issue_prefix: %v", err)
-	}
-
-	// Create an issue
-	issue := &types.Issue{
-		ID:          "bd-conflict",
-		Title:       "Original title",
-		Description: "Original description",
-		Status:      types.StatusOpen,
-		Priority:    1,
-		IssueType:   "bug",
-	}
-
-	if err := store.CreateIssue(ctx, issue, "test"); err != nil {
-		t.Fatalf("Failed to create issue: %v", err)
-	}
-
-	// Export and create base snapshot
-	if err := exportToJSONLWithStore(ctx, store, jsonlPath); err != nil {
-		t.Fatalf("Failed to export: %v", err)
-	}
-	if err := initializeSnapshotsIfNeeded(jsonlPath); err != nil {
-		t.Fatalf("Failed to initialize snapshots: %v", err)
-	}
-
-	// Modify the issue locally
-	updates := map[string]interface{}{
-		"title": "Modified title locally",
-	}
-	if err := store.UpdateIssue(ctx, "bd-conflict", updates, "test"); err != nil {
-		t.Fatalf("Failed to update issue: %v", err)
-	}
-
-	// Export modified state and capture left snapshot
-	if err := exportToJSONLWithStore(ctx, store, jsonlPath); err != nil {
-		t.Fatalf("Failed to export after modification: %v", err)
-	}
-	if err := captureLeftSnapshot(jsonlPath); err != nil {
-		t.Fatalf("Failed to capture left snapshot: %v", err)
-	}
-
-	// Simulate remote deletion (write empty JSONL)
-	if err := os.WriteFile(jsonlPath, []byte(""), 0644); err != nil {
-		t.Fatalf("Failed to simulate remote deletion: %v", err)
-	}
-
-	// Try to merge - deletion now wins over modification (bd-pq5k)
-	// This should succeed and delete the issue
-	_, err = merge3WayAndPruneDeletions(ctx, store, jsonlPath)
+	// merge3WayAndPruneDeletions is now a no-op: always returns (false, nil)
+	merged, err := merge3WayAndPruneDeletions(ctx, store, jsonlPath)
 	if err != nil {
-		t.Errorf("Expected merge to succeed (deletion wins), but got error: %v", err)
+		t.Fatalf("merge3WayAndPruneDeletions should not error: %v", err)
 	}
+	if merged {
+		t.Error("merge3WayAndPruneDeletions should return false (no-op)")
+	}
+}
 
-	// The issue should be deleted (deletion wins over modification)
-	conflictIssue, err := store.GetIssue(ctx, "bd-conflict")
-	if err == nil && conflictIssue != nil {
-		t.Error("Issue should be deleted after merge (deletion wins)")
+// TestDeletionWithLocalModification verifies merge3WayAndPruneDeletions is a no-op
+// (3-way merge engine removed; Dolt handles sync natively).
+func TestDeletionWithLocalModification(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	jsonlPath := filepath.Join(dir, "issues.jsonl")
+
+	dbPath := filepath.Join(dir, "beads.db")
+	store, err := dolt.New(context.Background(), &dolt.Config{Path: dbPath})
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	// merge3WayAndPruneDeletions is now a no-op
+	merged, err := merge3WayAndPruneDeletions(ctx, store, jsonlPath)
+	if err != nil {
+		t.Fatalf("merge3WayAndPruneDeletions should not error: %v", err)
+	}
+	if merged {
+		t.Error("merge3WayAndPruneDeletions should return false (no-op)")
 	}
 }
 
@@ -399,171 +212,7 @@ func TestSnapshotManagement(t *testing.T) {
 // TestMultiRepoDeletionTracking tests deletion tracking with multi-repo mode
 // This is the test for bd-4oob: snapshot files need to be created per-JSONL file
 func TestMultiRepoDeletionTracking(t *testing.T) {
-	initConfigForTest(t)
-	// Setup workspace directories
-	primaryDir := t.TempDir()
-	additionalDir := t.TempDir()
-
-	// Setup .beads directories
-	primaryBeadsDir := filepath.Join(primaryDir, ".beads")
-	additionalBeadsDir := filepath.Join(additionalDir, ".beads")
-	if err := os.MkdirAll(primaryBeadsDir, 0755); err != nil {
-		t.Fatalf("Failed to create primary .beads dir: %v", err)
-	}
-	if err := os.MkdirAll(additionalBeadsDir, 0755); err != nil {
-		t.Fatalf("Failed to create additional .beads dir: %v", err)
-	}
-
-	// Create database in primary dir
-	dbPath := filepath.Join(primaryBeadsDir, "beads.db")
-	ctx := context.Background()
-
-	store, err := sqlite.New(context.Background(), dbPath)
-	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
-	}
-	defer store.Close()
-
-	if err := store.SetConfig(ctx, "issue_prefix", "bd"); err != nil {
-		t.Fatalf("Failed to set issue_prefix: %v", err)
-	}
-
-	// Setup multi-repo config
-	config.Set("repos.primary", primaryDir)
-	config.Set("repos.additional", []string{additionalDir})
-	defer func() {
-		config.Set("repos.primary", "")
-		config.Set("repos.additional", nil)
-	}()
-
-	// Create issues in different repos
-	primaryIssue := &types.Issue{
-		ID:          "bd-primary",
-		Title:       "Primary repo issue",
-		Description: "This belongs to primary",
-		Status:      types.StatusOpen,
-		Priority:    1,
-		IssueType:   "task",
-		SourceRepo:  ".", // Primary repo
-	}
-
-	additionalIssue := &types.Issue{
-		ID:          "bd-additional",
-		Title:       "Additional repo issue",
-		Description: "This belongs to additional",
-		Status:      types.StatusOpen,
-		Priority:    1,
-		IssueType:   "task",
-		SourceRepo:  additionalDir,
-	}
-
-	if err := store.CreateIssue(ctx, primaryIssue, "test"); err != nil {
-		t.Fatalf("Failed to create primary issue: %v", err)
-	}
-	if err := store.CreateIssue(ctx, additionalIssue, "test"); err != nil {
-		t.Fatalf("Failed to create additional issue: %v", err)
-	}
-
-	// Export to multi-repo (this creates multiple JSONL files)
-	results, err := store.ExportToMultiRepo(ctx)
-	if err != nil {
-		t.Fatalf("ExportToMultiRepo failed: %v", err)
-	}
-	if results == nil {
-		t.Fatal("Expected multi-repo results, got nil")
-	}
-	if results["."] != 1 {
-		t.Errorf("Expected 1 issue in primary repo, got %d", results["."])
-	}
-	if results[additionalDir] != 1 {
-		t.Errorf("Expected 1 issue in additional repo, got %d", results[additionalDir])
-	}
-
-	// Verify JSONL files exist
-	primaryJSONL := filepath.Join(primaryBeadsDir, "issues.jsonl")
-	additionalJSONL := filepath.Join(additionalBeadsDir, "issues.jsonl")
-
-	if !fileExists(primaryJSONL) {
-		t.Fatalf("Primary JSONL not created: %s", primaryJSONL)
-	}
-	if !fileExists(additionalJSONL) {
-		t.Fatalf("Additional JSONL not created: %s", additionalJSONL)
-	}
-
-	// THIS IS THE BUG: Initialize snapshots - currently only works for single JSONL
-	// Should create snapshots for BOTH JSONL files
-	if err := initializeSnapshotsIfNeeded(primaryJSONL); err != nil {
-		t.Fatalf("Failed to initialize primary snapshots: %v", err)
-	}
-	if err := initializeSnapshotsIfNeeded(additionalJSONL); err != nil {
-		t.Fatalf("Failed to initialize additional snapshots: %v", err)
-	}
-
-	// Verify snapshot files exist for both repos
-	primarySM := NewSnapshotManager(primaryJSONL)
-	primaryBasePath, primaryLeftPath := primarySM.GetSnapshotPaths()
-	additionalSM := NewSnapshotManager(additionalJSONL)
-	additionalBasePath, additionalLeftPath := additionalSM.GetSnapshotPaths()
-
-	if !fileExists(primaryBasePath) {
-		t.Errorf("Primary base snapshot not created: %s", primaryBasePath)
-	}
-	if !fileExists(additionalBasePath) {
-		t.Errorf("Additional base snapshot not created: %s", additionalBasePath)
-	}
-
-	// Capture left snapshot BEFORE simulating git pull
-	// This represents our local state before the pull
-	if err := captureLeftSnapshot(primaryJSONL); err != nil {
-		t.Fatalf("Failed to capture primary left snapshot: %v", err)
-	}
-	if err := captureLeftSnapshot(additionalJSONL); err != nil {
-		t.Fatalf("Failed to capture additional left snapshot: %v", err)
-	}
-
-	// Simulate remote deletion: replace additional repo JSONL with empty file
-	// This simulates what happens after a git pull where remote deleted the issue
-	emptyFile, err := os.Create(additionalJSONL)
-	if err != nil {
-		t.Fatalf("Failed to create empty JSONL: %v", err)
-	}
-	emptyFile.Close()
-
-	// Verify left snapshots exist
-	if !fileExists(primaryLeftPath) {
-		t.Errorf("Primary left snapshot not created: %s", primaryLeftPath)
-	}
-	if !fileExists(additionalLeftPath) {
-		t.Errorf("Additional left snapshot not created: %s", additionalLeftPath)
-	}
-
-	// Now apply deletion tracking for additional repo
-	// This should detect that bd-additional was deleted remotely and remove it from DB
-	merged, err := merge3WayAndPruneDeletions(ctx, store, additionalJSONL)
-	if err != nil {
-		t.Fatalf("merge3WayAndPruneDeletions failed for additional repo: %v", err)
-	}
-	if !merged {
-		t.Error("Expected merge to be performed (base snapshot exists)")
-	}
-
-	// Verify the issue was deleted from the database
-	issue, err := store.GetIssue(ctx, "bd-additional")
-	if err != nil {
-		t.Errorf("Unexpected error getting issue: %v", err)
-	}
-	if issue != nil {
-		t.Errorf("Expected bd-additional to be deleted from database, but it still exists: %+v", issue)
-	}
-
-	// Verify primary issue still exists
-	primaryResult, err := store.GetIssue(ctx, "bd-primary")
-	if err != nil {
-		t.Errorf("Primary issue should still exist: %v", err)
-	}
-	if primaryResult == nil {
-		t.Error("Primary issue should not be nil")
-	}
+	t.Skip("JSONL multi-repo sync removed in Phase 2: ExportToMultiRepo no longer exists on Dolt backend")
 }
 
 // TestGetMultiRepoJSONLPaths_EmptyPaths tests handling of empty path configs
@@ -588,7 +237,7 @@ func TestGetMultiRepoJSONLPaths_Duplicates(t *testing.T) {
 	initConfigForTest(t)
 	// Setup temp dirs
 	primaryDir := t.TempDir()
-	
+
 	// Create .beads directories
 	if err := os.MkdirAll(filepath.Join(primaryDir, ".beads"), 0755); err != nil {
 		t.Fatalf("Failed to create .beads dir: %v", err)
@@ -603,14 +252,14 @@ func TestGetMultiRepoJSONLPaths_Duplicates(t *testing.T) {
 	}()
 
 	paths := getMultiRepoJSONLPaths()
-	
+
 	// Current implementation doesn't dedupe - just verify it returns all entries
 	// (This documents current behavior; future improvement could dedupe)
 	expectedCount := 3 // primary + 2 duplicates
 	if len(paths) != expectedCount {
 		t.Errorf("Expected %d paths, got %d: %v", expectedCount, len(paths), paths)
 	}
-	
+
 	// All should point to same JSONL location
 	expectedJSONL := filepath.Join(primaryDir, ".beads", "issues.jsonl")
 	for i, p := range paths {
@@ -627,7 +276,7 @@ func TestGetMultiRepoJSONLPaths_PathsWithSpaces(t *testing.T) {
 	baseDir := t.TempDir()
 	primaryDir := filepath.Join(baseDir, "my project")
 	additionalDir := filepath.Join(baseDir, "other repo")
-	
+
 	// Create .beads directories
 	if err := os.MkdirAll(filepath.Join(primaryDir, ".beads"), 0755); err != nil {
 		t.Fatalf("Failed to create primary .beads: %v", err)
@@ -644,15 +293,15 @@ func TestGetMultiRepoJSONLPaths_PathsWithSpaces(t *testing.T) {
 	}()
 
 	paths := getMultiRepoJSONLPaths()
-	
+
 	if len(paths) != 2 {
 		t.Fatalf("Expected 2 paths, got %d", len(paths))
 	}
-	
+
 	// Verify paths are constructed correctly
 	expectedPrimary := filepath.Join(primaryDir, ".beads", "issues.jsonl")
 	expectedAdditional := filepath.Join(additionalDir, ".beads", "issues.jsonl")
-	
+
 	if paths[0] != expectedPrimary {
 		t.Errorf("Primary path = %s, want %s", paths[0], expectedPrimary)
 	}
@@ -674,17 +323,17 @@ func TestGetMultiRepoJSONLPaths_RelativePaths(t *testing.T) {
 	}()
 
 	paths := getMultiRepoJSONLPaths()
-	
+
 	if len(paths) != 3 {
 		t.Fatalf("Expected 3 paths, got %d", len(paths))
 	}
-	
+
 	// Current implementation: relative paths are NOT expanded to absolute
 	// They're used as-is with filepath.Join
 	expectedPrimary := filepath.Join(".", ".beads", "issues.jsonl")
 	expectedOther := filepath.Join("../other", ".beads", "issues.jsonl")
 	expectedBar := filepath.Join("./foo/../bar", ".beads", "issues.jsonl")
-	
+
 	if paths[0] != expectedPrimary {
 		t.Errorf("Primary path = %s, want %s", paths[0], expectedPrimary)
 	}
@@ -708,15 +357,15 @@ func TestGetMultiRepoJSONLPaths_TildeExpansion(t *testing.T) {
 	}()
 
 	paths := getMultiRepoJSONLPaths()
-	
+
 	if len(paths) != 2 {
 		t.Fatalf("Expected 2 paths, got %d", len(paths))
 	}
-	
+
 	// Tilde should be literal (NOT expanded) in current implementation
 	expectedPrimary := filepath.Join("~/repos/main", ".beads", "issues.jsonl")
 	expectedAdditional := filepath.Join("~/repos/other", ".beads", "issues.jsonl")
-	
+
 	if paths[0] != expectedPrimary {
 		t.Errorf("Primary path = %s, want %s", paths[0], expectedPrimary)
 	}
@@ -872,7 +521,7 @@ func TestMultiRepoFlushPrefixFiltering(t *testing.T) {
 	dbPath := filepath.Join(additionalBeadsDir, "beads.db")
 	ctx := context.Background()
 
-	store, err := sqlite.New(context.Background(), dbPath)
+	store, err := dolt.New(context.Background(), &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}

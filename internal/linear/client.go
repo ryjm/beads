@@ -15,9 +15,9 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// IssuesQuery is the GraphQL query for fetching issues with all required fields.
+// issuesQuery is the GraphQL query for fetching issues with all required fields.
 // Used by both FetchIssues and FetchIssuesSince for consistency.
-const IssuesQuery = `
+const issuesQuery = `
 	query Issues($filter: IssueFilter!, $first: Int!, $after: String) {
 		issues(
 			first: $first
@@ -147,7 +147,7 @@ func (c *Client) Execute(ctx context.Context, req *GraphQLRequest) (json.RawMess
 		}
 
 		respBody, err := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
+		_ = resp.Body.Close() // Best effort: HTTP body close; connection may be reused regardless
 		if err != nil {
 			lastErr = fmt.Errorf("failed to read response (attempt %d/%d): %w", attempt+1, MaxRetries+1, err)
 			continue
@@ -239,7 +239,7 @@ func (c *Client) FetchIssues(ctx context.Context, state string) ([]Issue, error)
 		}
 
 		req := &GraphQLRequest{
-			Query:     IssuesQuery,
+			Query:     issuesQuery,
 			Variables: variables,
 		}
 
@@ -321,7 +321,7 @@ func (c *Client) FetchIssuesSince(ctx context.Context, state string, since time.
 		}
 
 		req := &GraphQLRequest{
-			Query:     IssuesQuery,
+			Query:     issuesQuery,
 			Variables: variables,
 		}
 

@@ -1,3 +1,5 @@
+//go:build cgo
+
 package main
 
 import (
@@ -5,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -101,8 +102,6 @@ func TestDoctorJSONOutput(t *testing.T) {
 		t.Errorf("Checks length mismatch: %d != %d", len(decoded.Checks), len(result.Checks))
 	}
 }
-
-// Note: isHashID is tested in migrate_hash_ids_test.go
 
 func TestDetectHashBasedIDs(t *testing.T) {
 	tests := []struct {
@@ -236,6 +235,7 @@ func TestDetectHashBasedIDs(t *testing.T) {
 }
 
 func TestCheckIDFormat(t *testing.T) {
+	t.Skip("SQLite-specific: creates SQLite database directly; Dolt backend can't read it")
 	tests := []struct {
 		name           string
 		issueIDs       []string
@@ -373,21 +373,19 @@ func TestCheckInstallation(t *testing.T) {
 }
 
 func TestCheckDatabaseVersionJSONLMode(t *testing.T) {
-	// Create temporary directory with .beads but no database
+	// Dolt backend doesn't have a "JSONL-only" mode; it reports fresh clone
+	// when no dolt/ directory exists but JSONL is present.
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
 	if err := os.Mkdir(beadsDir, 0750); err != nil {
 		t.Fatal(err)
 	}
 
-	// Create empty issues.jsonl to simulate --no-db mode
 	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
 	if err := os.WriteFile(jsonlPath, []byte{}, 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	// Create config.yaml with no-db: true to indicate intentional JSONL-only mode
-	// Without this, doctor treats it as a fresh clone needing 'bd init' (bd-4ew)
 	configPath := filepath.Join(beadsDir, "config.yaml")
 	if err := os.WriteFile(configPath, []byte("no-db: true\n"), 0644); err != nil {
 		t.Fatal(err)
@@ -395,14 +393,12 @@ func TestCheckDatabaseVersionJSONLMode(t *testing.T) {
 
 	check := doctor.CheckDatabaseVersion(tmpDir, Version)
 
-	if check.Status != doctor.StatusOK {
-		t.Errorf("Expected ok status for JSONL mode, got %s", check.Status)
+	// Dolt backend sees JSONL without dolt/ dir → fresh clone warning
+	if check.Status != doctor.StatusWarning {
+		t.Errorf("Expected warning status for Dolt fresh clone, got %s", check.Status)
 	}
-	if check.Message != "JSONL-only mode" {
-		t.Errorf("Expected JSONL-only mode message, got %s", check.Message)
-	}
-	if check.Detail == "" {
-		t.Error("Expected detail field to be set for JSONL mode")
+	if !strings.Contains(check.Message, "Fresh clone") {
+		t.Errorf("Expected fresh clone message, got %s", check.Message)
 	}
 }
 
@@ -426,7 +422,7 @@ func TestCheckDatabaseVersionFreshClone(t *testing.T) {
 	if check.Status != doctor.StatusWarning {
 		t.Errorf("Expected warning status for fresh clone, got %s", check.Status)
 	}
-	if check.Message != "Fresh clone detected (no database)" {
+	if !strings.Contains(check.Message, "Fresh clone detected") {
 		t.Errorf("Expected fresh clone message, got %s", check.Message)
 	}
 	if check.Fix == "" {
@@ -458,74 +454,6 @@ func TestCompareVersions(t *testing.T) {
 	}
 }
 
-func TestCheckMultipleDatabases(t *testing.T) {
-	tests := []struct {
-		name           string
-		dbFiles        []string
-		expectedStatus string
-		expectWarning  bool
-	}{
-		{
-			name:           "no databases",
-			dbFiles:        []string{},
-			expectedStatus: doctor.StatusOK,
-			expectWarning:  false,
-		},
-		{
-			name:           "single database",
-			dbFiles:        []string{"beads.db"},
-			expectedStatus: doctor.StatusOK,
-			expectWarning:  false,
-		},
-		{
-			name:           "multiple databases",
-			dbFiles:        []string{"beads.db", "old.db"},
-			expectedStatus: doctor.StatusWarning,
-			expectWarning:  true,
-		},
-		{
-			name:           "backup files ignored",
-			dbFiles:        []string{"beads.db", "beads.backup.db"},
-			expectedStatus: doctor.StatusOK,
-			expectWarning:  false,
-		},
-		{
-			name:           "vc.db ignored",
-			dbFiles:        []string{"beads.db", "vc.db"},
-			expectedStatus: doctor.StatusOK,
-			expectWarning:  false,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
-			beadsDir := filepath.Join(tmpDir, ".beads")
-			if err := os.Mkdir(beadsDir, 0750); err != nil {
-				t.Fatal(err)
-			}
-
-			// Create test database files
-			for _, dbFile := range tc.dbFiles {
-				path := filepath.Join(beadsDir, dbFile)
-				if err := os.WriteFile(path, []byte{}, 0644); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			check := doctor.CheckMultipleDatabases(tmpDir)
-
-			if check.Status != tc.expectedStatus {
-				t.Errorf("Expected status %s, got %s", tc.expectedStatus, check.Status)
-			}
-
-			if tc.expectWarning && check.Fix == "" {
-				t.Error("Expected fix message for warning status")
-			}
-		})
-	}
-}
-
 func TestCheckPermissions(t *testing.T) {
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
@@ -537,64 +465,6 @@ func TestCheckPermissions(t *testing.T) {
 
 	if check.Status != doctor.StatusOK {
 		t.Errorf("Expected ok status for writable directory, got %s: %s", check.Status, check.Message)
-	}
-}
-
-func TestCheckDatabaseJSONLSync(t *testing.T) {
-	tests := []struct {
-		name           string
-		hasDB          bool
-		hasJSONL       bool
-		expectedStatus string
-	}{
-		{
-			name:           "no database",
-			hasDB:          false,
-			hasJSONL:       true,
-			expectedStatus: doctor.StatusOK,
-		},
-		{
-			name:           "no JSONL",
-			hasDB:          true,
-			hasJSONL:       false,
-			expectedStatus: doctor.StatusOK,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
-			beadsDir := filepath.Join(tmpDir, ".beads")
-			if err := os.Mkdir(beadsDir, 0750); err != nil {
-				t.Fatal(err)
-			}
-
-			if tc.hasDB {
-				dbPath := filepath.Join(beadsDir, "beads.db")
-				// Skip database creation tests due to SQLite driver registration in tests
-				// The real doctor command works fine with actual databases
-				if tc.hasJSONL {
-					t.Skip("Database creation in tests requires complex driver setup")
-				}
-				// For no-JSONL case, just create an empty file
-				if err := os.WriteFile(dbPath, []byte{}, 0644); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			if tc.hasJSONL {
-				jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-				if err := os.WriteFile(jsonlPath, []byte{}, 0644); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			check := doctor.CheckDatabaseJSONLSync(tmpDir)
-
-			if check.Status != tc.expectedStatus {
-				t.Errorf("Expected status %s, got %s", tc.expectedStatus, check.Status)
-			}
-		})
 	}
 }
 
@@ -688,11 +558,13 @@ func TestCheckGitHooks(t *testing.T) {
 
 			runInDir(t, tmpDir, func() {
 				if tc.hasGitDir {
-					// Initialize a real git repository in the test directory
-					cmd := exec.Command("git", "init")
-					cmd.Dir = tmpDir
-					if err := cmd.Run(); err != nil {
-						t.Skipf("Skipping test: git init failed: %v", err)
+					// Copy cached git template (bd-ktng optimization)
+					initGitTemplate()
+					if gitTemplateErr != nil {
+						t.Fatalf("git template init failed: %v", gitTemplateErr)
+					}
+					if err := copyGitDir(gitTemplateDir, tmpDir); err != nil {
+						t.Fatalf("failed to copy git template: %v", err)
 					}
 
 					gitDir, err := git.GetGitDir()
@@ -713,7 +585,7 @@ func TestCheckGitHooks(t *testing.T) {
 					}
 				}
 
-				check := doctor.CheckGitHooks()
+				check := doctor.CheckGitHooks(Version)
 
 				if check.Status != tc.expectedStatus {
 					t.Errorf("Expected status %s, got %s", tc.expectedStatus, check.Status)
@@ -1071,11 +943,13 @@ func TestCheckSyncBranchConfig(t *testing.T) {
 		{
 			name: "sync.branch configured via env var",
 			setupFunc: func(t *testing.T, tmpDir string) {
-				// Initialize git repo
-				cmd := exec.Command("git", "init")
-				cmd.Dir = tmpDir
-				if err := cmd.Run(); err != nil {
-					t.Fatal(err)
+				// Copy cached git template (bd-ktng optimization)
+				initGitTemplate()
+				if gitTemplateErr != nil {
+					t.Fatalf("git template init failed: %v", gitTemplateErr)
+				}
+				if err := copyGitDir(gitTemplateDir, tmpDir); err != nil {
+					t.Fatalf("failed to copy git template: %v", err)
 				}
 
 				// Create .beads directory
@@ -1298,11 +1172,13 @@ func TestCheckSyncBranchHookCompatibility(t *testing.T) {
 			t.Setenv("BEADS_SYNC_BRANCH", tc.syncBranchEnv)
 
 			if tc.hasGitDir {
-				// Initialize a real git repo (git rev-parse needs this)
-				cmd := exec.Command("git", "init")
-				cmd.Dir = tmpDir
-				if err := cmd.Run(); err != nil {
-					t.Fatal(err)
+				// Copy cached git template (bd-ktng optimization)
+				initGitTemplate()
+				if gitTemplateErr != nil {
+					t.Fatalf("git template init failed: %v", gitTemplateErr)
+				}
+				if err := copyGitDir(gitTemplateDir, tmpDir); err != nil {
+					t.Fatalf("failed to copy git template: %v", err)
 				}
 
 				// Create pre-push hook if specified
@@ -1370,11 +1246,13 @@ func TestCheckSyncBranchHookQuick(t *testing.T) {
 			t.Setenv("BEADS_SYNC_BRANCH", tc.syncBranchEnv)
 
 			if tc.hasGitDir {
-				// Initialize a real git repo (git rev-parse needs this)
-				cmd := exec.Command("git", "init")
-				cmd.Dir = tmpDir
-				if err := cmd.Run(); err != nil {
-					t.Fatal(err)
+				// Copy cached git template (bd-ktng optimization)
+				initGitTemplate()
+				if gitTemplateErr != nil {
+					t.Fatalf("git template init failed: %v", gitTemplateErr)
+				}
+				if err := copyGitDir(gitTemplateDir, tmpDir); err != nil {
+					t.Fatalf("failed to copy git template: %v", err)
 				}
 
 				if tc.hookVersion != "" {

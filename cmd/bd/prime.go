@@ -13,34 +13,8 @@ import (
 	"github.com/steveyegge/beads"
 	internalbeads "github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
-	"github.com/steveyegge/beads/internal/rpc"
 	"github.com/steveyegge/beads/internal/syncbranch"
 )
-
-// isDaemonAutoSyncing checks if daemon is running with auto-commit and auto-push enabled.
-// Returns false if daemon is not running or check fails (fail-safe to show full protocol).
-// This is a variable to allow stubbing in tests.
-var isDaemonAutoSyncing = func() bool {
-	beadsDir := beads.FindBeadsDir()
-	if beadsDir == "" {
-		return false
-	}
-
-	socketPath := filepath.Join(beadsDir, "bd.sock")
-	client, err := rpc.TryConnect(socketPath)
-	if err != nil || client == nil {
-		return false
-	}
-	defer func() { _ = client.Close() }()
-
-	status, err := client.Status()
-	if err != nil {
-		return false
-	}
-
-	// Only check auto-commit and auto-push (auto-pull is separate)
-	return status.AutoCommit && status.AutoPush
-}
 
 var (
 	primeFullMode    bool
@@ -217,16 +191,12 @@ func outputPrimeContext(w io.Writer, mcpMode bool, stealthMode bool) error {
 func outputMCPContext(w io.Writer, stealthMode bool) error {
 	ephemeral := isEphemeralBranch()
 	noPush := config.GetBool("no-push")
-	autoSync := isDaemonAutoSyncing()
 	localOnly := !primeHasGitRemote()
 
 	var closeProtocol string
 	if stealthMode || localOnly {
 		// Stealth mode or local-only: only flush to JSONL, no git operations
 		closeProtocol = "Before saying \"done\": bd sync --flush-only"
-	} else if autoSync && !ephemeral && !noPush {
-		// Daemon is auto-syncing - no bd sync needed
-		closeProtocol = "Before saying \"done\": git status → git add → git commit → git push (beads auto-synced by daemon)"
 	} else if ephemeral {
 		closeProtocol = "Before saying \"done\": git status → git add → bd sync --from-main → git commit (no push - ephemeral branch)"
 	} else if noPush {
@@ -259,7 +229,6 @@ Start: Check ` + "`ready`" + ` tool for available work.
 func outputCLIContext(w io.Writer, stealthMode bool) error {
 	ephemeral := isEphemeralBranch()
 	noPush := config.GetBool("no-push")
-	autoSync := isDaemonAutoSyncing()
 	localOnly := !primeHasGitRemote()
 
 	var closeProtocol string
@@ -285,22 +254,6 @@ bd sync --flush-only        # Export to JSONL
 		} else {
 			gitWorkflowRule = "Git workflow: stealth mode (no git ops)"
 		}
-	} else if autoSync && !ephemeral && !noPush {
-		// Daemon is auto-syncing - simplified protocol (no bd sync needed)
-		closeProtocol = `[ ] 1. git status              (check what changed)
-[ ] 2. git add <files>         (stage code changes)
-[ ] 3. git commit -m "..."     (commit code)
-[ ] 4. git push                (push to remote)`
-		closeNote = "**Note:** Daemon is auto-syncing beads changes. No manual `bd sync` needed."
-		syncSection = `### Sync & Collaboration
-- Daemon handles beads sync automatically (auto-commit + auto-push + auto-pull enabled)
-- ` + "`bd sync --status`" + ` - Check sync status`
-		completingWorkflow = `**Completing work:**
-` + "```bash" + `
-bd close <id1> <id2> ...    # Close all completed issues at once
-git push                    # Push to remote (beads auto-synced by daemon)
-` + "```"
-		gitWorkflowRule = "Git workflow: daemon auto-syncs beads changes"
 	} else if ephemeral {
 		closeProtocol = `[ ] 1. git status              (check what changed)
 [ ] 2. git add <files>         (stage code changes)
@@ -388,7 +341,7 @@ bd sync                     # Push to remote
 - ` + "`bd show <id>`" + ` - Detailed issue view with dependencies
 
 ### Creating & Updating
-- ` + "`bd create --title=\"...\" --type=task|bug|feature --priority=2`" + ` - New issue
+- ` + "`bd create --title=\"Summary of this issue\" --description=\"Why this issue exists and what needs to be done\" --type=task|bug|feature --priority=2`" + ` - New issue
   - Priority: 0-4 or P0-P4 (0=critical, 2=medium, 4=backlog). NOT "high"/"medium"/"low"
 - ` + "`bd update <id> --status=in_progress`" + ` - Claim work
 - ` + "`bd update <id> --assignee=username`" + ` - Assign to someone
@@ -424,8 +377,8 @@ bd update <id> --status=in_progress  # Claim it
 **Creating dependent work:**
 ` + "```bash" + `
 # Run bd create commands in parallel (use subagents for many items)
-bd create --title="Implement feature X" --type=feature
-bd create --title="Write tests for X" --type=task
+bd create --title="Implement feature X" --description="Why this issue exists and what needs to be done" --type=feature
+bd create --title="Write tests for X" --description="Why this issue exists and what needs to be done" --type=task
 bd dep add beads-yyy beads-xxx  # Tests depend on Feature (Feature blocks tests)
 ` + "```" + `
 `

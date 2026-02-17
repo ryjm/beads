@@ -128,7 +128,7 @@ func (s *DoltStore) AddFederationPeer(ctx context.Context, peer *storage.Federat
 	}
 
 	// Upsert the peer credentials
-	_, err = s.db.ExecContext(ctx, `
+	_, err = s.execContext(ctx, `
 		INSERT INTO federation_peers (name, remote_url, username, password_encrypted, sovereignty)
 		VALUES (?, ?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE
@@ -194,7 +194,7 @@ func (s *DoltStore) GetFederationPeer(ctx context.Context, name string) (*storag
 
 // ListFederationPeers returns all configured federation peers.
 func (s *DoltStore) ListFederationPeers(ctx context.Context) ([]*storage.FederationPeer, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.queryContext(ctx, `
 		SELECT name, remote_url, username, password_encrypted, sovereignty, last_sync, created_at, updated_at
 		FROM federation_peers ORDER BY name
 	`)
@@ -237,26 +237,26 @@ func (s *DoltStore) ListFederationPeers(ctx context.Context) ([]*storage.Federat
 
 // RemoveFederationPeer removes a federation peer and its credentials.
 func (s *DoltStore) RemoveFederationPeer(ctx context.Context, name string) error {
-	result, err := s.db.ExecContext(ctx, "DELETE FROM federation_peers WHERE name = ?", name)
+	result, err := s.execContext(ctx, "DELETE FROM federation_peers WHERE name = ?", name)
 	if err != nil {
 		return fmt.Errorf("failed to remove federation peer: %w", err)
 	}
 
-	rows, _ := result.RowsAffected()
+	rows, _ := result.RowsAffected() // Best effort: rows affected is used only for logging
 	if rows == 0 {
 		// Peer not in credentials table, but might still be a Dolt remote
 		// Continue to try removing the remote
 	}
 
 	// Also remove the Dolt remote (best-effort)
-	_ = s.RemoveRemote(ctx, name)
+	_ = s.RemoveRemote(ctx, name) // Best effort cleanup before re-adding remote
 
 	return nil
 }
 
-// UpdatePeerLastSync updates the last sync time for a peer.
-func (s *DoltStore) UpdatePeerLastSync(ctx context.Context, name string) error {
-	_, err := s.db.ExecContext(ctx, "UPDATE federation_peers SET last_sync = CURRENT_TIMESTAMP WHERE name = ?", name)
+// updatePeerLastSync updates the last sync time for a peer.
+func (s *DoltStore) updatePeerLastSync(ctx context.Context, name string) error {
+	_, err := s.execContext(ctx, "UPDATE federation_peers SET last_sync = CURRENT_TIMESTAMP WHERE name = ?", name)
 	return err
 }
 
@@ -266,16 +266,16 @@ func (s *DoltStore) UpdatePeerLastSync(ctx context.Context, name string) error {
 func setFederationCredentials(username, password string) func() {
 	if username != "" {
 		// Best-effort: failures here should not crash the caller.
-		_ = os.Setenv("DOLT_REMOTE_USER", username)
+		_ = os.Setenv("DOLT_REMOTE_USER", username) // Best effort: Setenv failure is extremely rare in practice
 	}
 	if password != "" {
 		// Best-effort: failures here should not crash the caller.
-		_ = os.Setenv("DOLT_REMOTE_PASSWORD", password)
+		_ = os.Setenv("DOLT_REMOTE_PASSWORD", password) // Best effort: Setenv failure is extremely rare in practice
 	}
 	return func() {
 		// Best-effort cleanup.
-		_ = os.Unsetenv("DOLT_REMOTE_USER")
-		_ = os.Unsetenv("DOLT_REMOTE_PASSWORD")
+		_ = os.Unsetenv("DOLT_REMOTE_USER")     // Best effort cleanup of auth env vars
+		_ = os.Unsetenv("DOLT_REMOTE_PASSWORD") // Best effort cleanup of auth env vars
 	}
 }
 
@@ -304,28 +304,10 @@ func (s *DoltStore) withPeerCredentials(ctx context.Context, peerName string, fn
 
 	// Update last sync time on success
 	if err == nil && peer != nil {
-		_ = s.UpdatePeerLastSync(ctx, peerName)
+		_ = s.updatePeerLastSync(ctx, peerName) // Best effort: peer sync timestamp is advisory
 	}
 
 	return err
-}
-
-// PushWithCredentials pushes to a remote using stored credentials.
-func (s *DoltStore) PushWithCredentials(ctx context.Context, remoteName string) error {
-	return s.withPeerCredentials(ctx, remoteName, func() error {
-		return s.PushTo(ctx, remoteName)
-	})
-}
-
-// PullWithCredentials pulls from a remote using stored credentials.
-func (s *DoltStore) PullWithCredentials(ctx context.Context, remoteName string) ([]storage.Conflict, error) {
-	var conflicts []storage.Conflict
-	err := s.withPeerCredentials(ctx, remoteName, func() error {
-		var pullErr error
-		conflicts, pullErr = s.PullFrom(ctx, remoteName)
-		return pullErr
-	})
-	return conflicts, err
 }
 
 // FederationPeer is an alias for storage.FederationPeer for convenience.

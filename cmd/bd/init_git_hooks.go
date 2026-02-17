@@ -3,16 +3,13 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/ui"
 )
-
 
 // preCommitFrameworkPattern matches pre-commit or prek framework hooks.
 // Uses same patterns as hookManagerPatterns in doctor/fix/hooks.go for consistency.
@@ -108,32 +105,6 @@ func detectExistingHooks() []hookInfo {
 	return hooks
 }
 
-// promptHookAction asks user what to do with existing hooks
-func promptHookAction(existingHooks []hookInfo) string {
-	fmt.Printf("\n%s Found existing git hooks:\n", ui.RenderWarn("⚠"))
-	for _, hook := range existingHooks {
-		if hook.exists && !hook.isBdHook {
-			hookType := "custom script"
-			if hook.isPreCommitFramework {
-				hookType = "pre-commit/prek framework"
-			}
-			fmt.Printf("  - %s (%s)\n", hook.name, hookType)
-		}
-	}
-
-	fmt.Printf("\nHow should bd proceed?\n")
-	fmt.Printf("  [1] Chain with existing hooks (recommended)\n")
-	fmt.Printf("  [2] Overwrite existing hooks\n")
-	fmt.Printf("  [3] Skip git hooks installation\n")
-	fmt.Printf("Choice [1-3]: ")
-
-	var response string
-	_, _ = fmt.Scanln(&response)
-	response = strings.TrimSpace(response)
-
-	return response
-}
-
 // installGitHooks installs git hooks inline (no external dependencies)
 func installGitHooks() error {
 	hooksDir, err := git.GetGitHooksDir()
@@ -158,41 +129,20 @@ func installGitHooks() error {
 		}
 	}
 
-	// Determine installation mode
-	chainHooks := false
-	if hasExistingHooks {
-		choice := promptHookAction(existingHooks)
-		switch choice {
-		case "1", "":
-			chainHooks = true
-			// Chain mode - rename existing hooks to .old so they can be called
-			for _, hook := range existingHooks {
-				if hook.exists && !hook.isBdHook {
-					oldPath := hook.path + ".old"
-					if err := os.Rename(hook.path, oldPath); err != nil {
-						return fmt.Errorf("failed to rename %s to .old: %w", hook.name, err)
-					}
-					fmt.Printf("  Renamed %s to %s\n", hook.name, filepath.Base(oldPath))
+	// Default to chaining with existing hooks (no prompting)
+	chainHooks := hasExistingHooks
+	if chainHooks {
+		// Chain mode - rename existing hooks to .old so they can be called
+		for _, hook := range existingHooks {
+			if hook.exists && !hook.isBdHook {
+				oldPath := hook.path + ".old"
+				if err := os.Rename(hook.path, oldPath); err != nil {
+					fmt.Fprintf(os.Stderr, "%s Failed to chain with existing %s hook: %v\n", ui.RenderWarn("⚠"), hook.name, err)
+					fmt.Fprintf(os.Stderr, "You can resolve this with: %s\n", ui.RenderAccent("bd doctor --fix"))
+					continue
 				}
+				fmt.Printf("  Chained with existing %s hook\n", hook.name)
 			}
-		case "2":
-			// Overwrite mode - backup existing hooks
-			for _, hook := range existingHooks {
-				if hook.exists && !hook.isBdHook {
-					timestamp := time.Now().Format("20060102-150405")
-					backup := hook.path + ".backup-" + timestamp
-					if err := os.Rename(hook.path, backup); err != nil {
-						return fmt.Errorf("failed to backup %s: %w", hook.name, err)
-					}
-					fmt.Printf("  Backed up %s to %s\n", hook.name, filepath.Base(backup))
-				}
-			}
-		case "3":
-			fmt.Printf("Skipping git hooks installation.\n")
-			fmt.Printf("You can install manually later with: %s\n", ui.RenderAccent("./examples/git-hooks/install.sh"))
-			return nil
-		default:
-			return fmt.Errorf("invalid choice: %s", choice)
 		}
 	}
 
@@ -259,7 +209,7 @@ fi
 #
 # This hook ensures that any pending bd issue changes are flushed to
 # .beads/issues.jsonl before the commit is created, preventing the
-# race condition where daemon auto-flush fires after the commit.
+# stale JSONL from being committed.
 
 ` + preCommitHookBody()
 }
@@ -421,39 +371,6 @@ exit 0
 `
 }
 
-// mergeDriverInstalled checks if bd merge driver is configured correctly
-// Note: This runs during bd init BEFORE .beads exists, so it runs git in CWD.
-func mergeDriverInstalled() bool {
-	// Check git config for merge driver (runs in CWD)
-	cmd := exec.Command("git", "config", "merge.beads.driver")
-	output, err := cmd.Output()
-	if err != nil || len(output) == 0 {
-		return false
-	}
-
-	// Check if using old invalid placeholders (%L/%R from versions <0.24.0)
-	// Git only supports %O (base), %A (current), %B (other)
-	driverConfig := strings.TrimSpace(string(output))
-	if strings.Contains(driverConfig, "%L") || strings.Contains(driverConfig, "%R") {
-		// Stale config with invalid placeholders - needs repair
-		return false
-	}
-
-	// Check if .gitattributes has the merge driver configured
-	gitattributesPath := ".gitattributes"
-	content, err := os.ReadFile(gitattributesPath)
-	if err != nil {
-		return false
-	}
-
-	// Look for beads JSONL merge attribute (either canonical or legacy filename)
-	hasCanonical := strings.Contains(string(content), ".beads/issues.jsonl") &&
-		strings.Contains(string(content), "merge=beads")
-	hasLegacy := strings.Contains(string(content), ".beads/beads.jsonl") &&
-		strings.Contains(string(content), "merge=beads")
-	return hasCanonical || hasLegacy
-}
-
 // installJJHooks installs simplified git hooks for colocated jujutsu+git repos.
 // jj's model is simpler: the working copy IS always a commit, so no staging needed.
 // Changes flow into the current change automatically.
@@ -480,40 +397,20 @@ func installJJHooks() error {
 		}
 	}
 
-	// Determine installation mode
-	chainHooks := false
-	if hasExistingHooks {
-		choice := promptHookAction(existingHooks)
-		switch choice {
-		case "1", "":
-			chainHooks = true
-			// Chain mode - rename existing hooks to .old so they can be called
-			for _, hook := range existingHooks {
-				if hook.exists && !hook.isBdHook {
-					oldPath := hook.path + ".old"
-					if err := os.Rename(hook.path, oldPath); err != nil {
-						return fmt.Errorf("failed to rename %s to .old: %w", hook.name, err)
-					}
-					fmt.Printf("  Renamed %s to %s\n", hook.name, filepath.Base(oldPath))
+	// Default to chaining with existing hooks (no prompting)
+	chainHooks := hasExistingHooks
+	if chainHooks {
+		// Chain mode - rename existing hooks to .old so they can be called
+		for _, hook := range existingHooks {
+			if hook.exists && !hook.isBdHook {
+				oldPath := hook.path + ".old"
+				if err := os.Rename(hook.path, oldPath); err != nil {
+					fmt.Fprintf(os.Stderr, "%s Failed to chain with existing %s hook: %v\n", ui.RenderWarn("⚠"), hook.name, err)
+					fmt.Fprintf(os.Stderr, "You can resolve this with: %s\n", ui.RenderAccent("bd doctor --fix"))
+					continue
 				}
+				fmt.Printf("  Chained with existing %s hook\n", hook.name)
 			}
-		case "2":
-			// Overwrite mode - backup existing hooks
-			for _, hook := range existingHooks {
-				if hook.exists && !hook.isBdHook {
-					timestamp := time.Now().Format("20060102-150405")
-					backup := hook.path + ".backup-" + timestamp
-					if err := os.Rename(hook.path, backup); err != nil {
-						return fmt.Errorf("failed to backup %s: %w", hook.name, err)
-					}
-					fmt.Printf("  Backed up %s to %s\n", hook.name, filepath.Base(backup))
-				}
-			}
-		case "3":
-			fmt.Printf("Skipping git hooks installation.\n")
-			return nil
-		default:
-			return fmt.Errorf("invalid choice: %s", choice)
 		}
 	}
 
@@ -645,55 +542,4 @@ func printJJAliasInstructions() {
 	fmt.Printf("  %s\n", ui.RenderAccent(`push = ["util", "exec", "--", "sh", "-c", "bd sync --flush-only && jj git push \"$@\"", ""]`))
 	fmt.Printf("\nThen use %s instead of %s\n\n", ui.RenderAccent("jj push"), ui.RenderAccent("jj git push"))
 	fmt.Printf("For more details, see: https://github.com/steveyegge/beads/blob/main/docs/JUJUTSU.md\n\n")
-}
-
-// installMergeDriver configures git to use bd merge for JSONL files
-// Note: This runs during bd init BEFORE .beads exists, so it runs git in CWD.
-func installMergeDriver() error {
-	// Configure git merge driver (runs in CWD)
-	cmd := exec.Command("git", "config", "merge.beads.driver", "bd merge %A %O %A %B")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to configure git merge driver: %w\n%s", err, output)
-	}
-
-	cmd = exec.Command("git", "config", "merge.beads.name", "bd JSONL merge driver")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		// Non-fatal, the name is just descriptive
-		fmt.Fprintf(os.Stderr, "Warning: failed to set merge driver name: %v\n%s", err, output)
-	}
-
-	// Create or update .gitattributes
-	gitattributesPath := ".gitattributes"
-
-	// Read existing .gitattributes if it exists
-	var existingContent string
-	content, err := os.ReadFile(gitattributesPath)
-	if err == nil {
-		existingContent = string(content)
-	}
-
-	// Check if beads merge driver is already configured
-	// Check for either pattern (issues.jsonl is canonical, beads.jsonl is legacy)
-	hasBeadsMerge := (strings.Contains(existingContent, ".beads/issues.jsonl") ||
-		strings.Contains(existingContent, ".beads/beads.jsonl")) &&
-		strings.Contains(existingContent, "merge=beads")
-
-	if !hasBeadsMerge {
-		// Append beads merge driver configuration (issues.jsonl is canonical)
-		beadsMergeAttr := "\n# Use bd merge for beads JSONL files\n.beads/issues.jsonl merge=beads\n"
-
-		newContent := existingContent
-		if !strings.HasSuffix(newContent, "\n") && len(newContent) > 0 {
-			newContent += "\n"
-		}
-		newContent += beadsMergeAttr
-
-		// Write updated .gitattributes (0644 is standard for .gitattributes)
-		// #nosec G306 - .gitattributes needs to be readable
-		if err := os.WriteFile(gitattributesPath, []byte(newContent), 0644); err != nil {
-			return fmt.Errorf("failed to update .gitattributes: %w", err)
-		}
-	}
-
-	return nil
 }

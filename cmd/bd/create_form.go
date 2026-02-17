@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -10,8 +9,7 @@ import (
 
 	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/rpc"
-	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -95,7 +93,7 @@ func parseCreateFormInput(raw *createFormRawInput) *createFormValues {
 // CreateIssueFromFormValues creates an issue from the given form values.
 // It returns the created issue and any error that occurred.
 // This function handles labels, dependencies, and source_repo inheritance.
-func CreateIssueFromFormValues(ctx context.Context, s storage.Storage, fv *createFormValues, actor string) (*types.Issue, error) {
+func CreateIssueFromFormValues(ctx context.Context, s *dolt.DoltStore, fv *createFormValues, actor string) (*types.Issue, error) {
 	var externalRefPtr *string
 	if fv.ExternalRef != "" {
 		externalRefPtr = &fv.ExternalRef
@@ -341,46 +339,11 @@ func runCreateForm(cmd *cobra.Command) {
 	// Parse the form input
 	fv := parseCreateFormInput(raw)
 
-	// If daemon is running, use RPC
-	if daemonClient != nil {
-		createArgs := &rpc.CreateArgs{
-			Title:              fv.Title,
-			Description:        fv.Description,
-			IssueType:          fv.IssueType,
-			Priority:           fv.Priority,
-			Design:             fv.Design,
-			AcceptanceCriteria: fv.AcceptanceCriteria,
-			Assignee:           fv.Assignee,
-			ExternalRef:        fv.ExternalRef,
-			Labels:             fv.Labels,
-			Dependencies:       fv.Dependencies,
-		}
-
-		resp, err := daemonClient.Create(createArgs)
-		if err != nil {
-			FatalError("%v", err)
-		}
-
-		if jsonOutput {
-			fmt.Println(string(resp.Data))
-		} else {
-			var issue types.Issue
-			if err := json.Unmarshal(resp.Data, &issue); err != nil {
-				FatalError("parsing response: %v", err)
-			}
-			printCreatedIssue(&issue)
-		}
-		return
-	}
-
 	// Direct mode - use the extracted creation function
 	issue, err := CreateIssueFromFormValues(rootCtx, store, fv, actor)
 	if err != nil {
 		FatalError("%v", err)
 	}
-
-	// Schedule auto-flush
-	markDirtyAndScheduleFlush()
 
 	if jsonOutput {
 		outputJSON(issue)

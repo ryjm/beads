@@ -7,14 +7,19 @@ import (
 	"time"
 )
 
-//nolint:unparam // readOnly is used to add mode=ro to connection string
+// sqliteConnString builds a SQLite connection string with standard pragmas.
+// Inlined from the removed storage.SQLiteConnString after the Phase 7 refactor
+// removed the storage factory and connection string helpers.
+//
+// Includes busy_timeout (prevents "database is locked" under concurrency),
+// foreign_keys (enforces referential integrity), and time_format pragmas
+// that the simplified upstream version dropped.
 func sqliteConnString(path string, readOnly bool) string {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return ""
 	}
 
-	// Best-effort: honor the same env var viper uses (BD_LOCK_TIMEOUT).
 	busy := 30 * time.Second
 	if v := strings.TrimSpace(os.Getenv("BD_LOCK_TIMEOUT")); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -23,7 +28,6 @@ func sqliteConnString(path string, readOnly bool) string {
 	}
 	busyMs := int64(busy / time.Millisecond)
 
-	// If it's already a URI, append pragmas if absent.
 	if strings.HasPrefix(path, "file:") {
 		conn := path
 		sep := "?"

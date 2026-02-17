@@ -1,3 +1,5 @@
+//go:build cgo
+
 package doctor
 
 import (
@@ -6,10 +8,23 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/steveyegge/beads/internal/beads"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
+
+// setupDoltTestDir creates a beads dir with metadata.json pointing to dolt backend
+// and returns the dolt store path. Tests that use dolt.New() directly need this
+// so that the factory (used by doctor checks) can find the database.
+func setupDoltTestDir(t *testing.T, beadsDir string) string {
+	t.Helper()
+	cfg := configfile.DefaultConfig()
+	cfg.Backend = configfile.BackendDolt
+	if err := cfg.Save(beadsDir); err != nil {
+		t.Fatalf("Failed to save config: %v", err)
+	}
+	return filepath.Join(beadsDir, "dolt")
+}
 
 // TestCheckDuplicateIssues_ClosedIssuesExcluded verifies that closed issues
 // are not flagged as duplicates (bug fix: bd-sali).
@@ -22,10 +37,10 @@ func TestCheckDuplicateIssues_ClosedIssuesExcluded(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := filepath.Join(beadsDir, beads.CanonicalDatabaseName)
+	dbPath := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := sqlite.New(ctx, dbPath)
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -71,10 +86,10 @@ func TestCheckDuplicateIssues_OpenDuplicatesDetected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := filepath.Join(beadsDir, beads.CanonicalDatabaseName)
+	dbPath := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := sqlite.New(ctx, dbPath)
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -119,10 +134,10 @@ func TestCheckDuplicateIssues_DifferentDesignNotDuplicate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := filepath.Join(beadsDir, beads.CanonicalDatabaseName)
+	dbPath := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := sqlite.New(ctx, dbPath)
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -166,10 +181,10 @@ func TestCheckDuplicateIssues_MixedOpenClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := filepath.Join(beadsDir, beads.CanonicalDatabaseName)
+	dbPath := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := sqlite.New(ctx, dbPath)
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -211,19 +226,19 @@ func TestCheckDuplicateIssues_MixedOpenClosed(t *testing.T) {
 	}
 }
 
-// TestCheckDuplicateIssues_TombstonesExcluded verifies tombstoned issues
+// TestCheckDuplicateIssues_DeletedExcluded verifies deleted issues
 // are excluded from duplicate detection.
-func TestCheckDuplicateIssues_TombstonesExcluded(t *testing.T) {
+func TestCheckDuplicateIssues_DeletedExcluded(t *testing.T) {
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
 	if err := os.Mkdir(beadsDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 
-	dbPath := filepath.Join(beadsDir, beads.CanonicalDatabaseName)
+	dbPath := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := sqlite.New(ctx, dbPath)
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -234,10 +249,10 @@ func TestCheckDuplicateIssues_TombstonesExcluded(t *testing.T) {
 		t.Fatalf("Failed to set issue_prefix: %v", err)
 	}
 
-	// Create tombstoned issues - these should NOT be flagged
+	// Create deleted issues - these should NOT be flagged
 	issues := []*types.Issue{
-		{Title: "Deleted issue", Description: "Was deleted", Status: types.StatusTombstone, Priority: 2, IssueType: types.TypeTask},
-		{Title: "Deleted issue", Description: "Was deleted", Status: types.StatusTombstone, Priority: 2, IssueType: types.TypeTask},
+		{Title: "Deleted issue", Description: "Was deleted", Status: types.StatusClosed, Priority: 2, IssueType: types.TypeTask},
+		{Title: "Deleted issue", Description: "Was deleted", Status: types.StatusClosed, Priority: 2, IssueType: types.TypeTask},
 	}
 
 	for _, issue := range issues {
@@ -251,7 +266,7 @@ func TestCheckDuplicateIssues_TombstonesExcluded(t *testing.T) {
 	check := CheckDuplicateIssues(tmpDir, false, 1000)
 
 	if check.Status != StatusOK {
-		t.Errorf("Status = %q, want %q (tombstones should be excluded)", check.Status, StatusOK)
+		t.Errorf("Status = %q, want %q (closed/deleted issues should be excluded)", check.Status, StatusOK)
 	}
 }
 
@@ -270,8 +285,18 @@ func TestCheckDuplicateIssues_NoDatabase(t *testing.T) {
 	if check.Status != StatusOK {
 		t.Errorf("Status = %q, want %q", check.Status, StatusOK)
 	}
-	if check.Message != "N/A (no database)" {
-		t.Errorf("Message = %q, want 'N/A (no database)'", check.Message)
+	// When no Dolt database exists, openStoreDB may create an empty one but
+	// the duplicate query will fail since no schema exists.
+	wantMessages := []string{"N/A (no database)", "N/A (unable to query issues)"}
+	found := false
+	for _, msg := range wantMessages {
+		if check.Message == msg {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("Message = %q, want one of %v", check.Message, wantMessages)
 	}
 }
 
@@ -284,10 +309,10 @@ func TestCheckDuplicateIssues_GastownUnderThreshold(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := filepath.Join(beadsDir, beads.CanonicalDatabaseName)
+	dbPath := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := sqlite.New(ctx, dbPath)
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -335,10 +360,10 @@ func TestCheckDuplicateIssues_GastownOverThreshold(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := filepath.Join(beadsDir, beads.CanonicalDatabaseName)
+	dbPath := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := sqlite.New(ctx, dbPath)
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -384,10 +409,10 @@ func TestCheckDuplicateIssues_GastownCustomThreshold(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := filepath.Join(beadsDir, beads.CanonicalDatabaseName)
+	dbPath := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := sqlite.New(ctx, dbPath)
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -434,10 +459,10 @@ func TestCheckDuplicateIssues_NonGastownMode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := filepath.Join(beadsDir, beads.CanonicalDatabaseName)
+	dbPath := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := sqlite.New(ctx, dbPath)
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -472,5 +497,118 @@ func TestCheckDuplicateIssues_NonGastownMode(t *testing.T) {
 	}
 	if check.Message != "50 duplicate issue(s) in 1 group(s)" {
 		t.Errorf("Message = %q, want '50 duplicate issue(s) in 1 group(s)'", check.Message)
+	}
+}
+
+// TestCheckDuplicateIssues_MultipleDuplicateGroups verifies correct counting
+// when there are multiple distinct groups of duplicates.
+// groupCount should reflect the number of groups, dupCount the total extras.
+func TestCheckDuplicateIssues_MultipleDuplicateGroups(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.Mkdir(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := setupDoltTestDir(t, beadsDir)
+	ctx := context.Background()
+
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("Failed to set issue_prefix: %v", err)
+	}
+
+	// Group A: 3 identical issues (2 duplicates)
+	for i := 0; i < 3; i++ {
+		issue := &types.Issue{
+			Title:       "Auth bug",
+			Description: "Login fails",
+			Status:      types.StatusOpen,
+			Priority:    1,
+			IssueType:   types.TypeBug,
+		}
+		if err := store.CreateIssue(ctx, issue, "test"); err != nil {
+			t.Fatalf("Failed to create issue: %v", err)
+		}
+	}
+
+	// Group B: 2 identical issues (1 duplicate), different content from A
+	for i := 0; i < 2; i++ {
+		issue := &types.Issue{
+			Title:       "Add dark mode",
+			Description: "Users want dark mode",
+			Status:      types.StatusOpen,
+			Priority:    2,
+			IssueType:   types.TypeFeature,
+		}
+		if err := store.CreateIssue(ctx, issue, "test"); err != nil {
+			t.Fatalf("Failed to create issue: %v", err)
+		}
+	}
+
+	store.Close()
+
+	check := CheckDuplicateIssues(tmpDir, false, 1000)
+
+	if check.Status != StatusWarning {
+		t.Errorf("Status = %q, want %q", check.Status, StatusWarning)
+	}
+	// 2 groups, 3 total duplicates (2 from group A + 1 from group B)
+	if check.Message != "3 duplicate issue(s) in 2 group(s)" {
+		t.Errorf("Message = %q, want '3 duplicate issue(s) in 2 group(s)'", check.Message)
+	}
+}
+
+// TestCheckDuplicateIssues_ZeroDuplicatesNullHandling verifies that when no
+// duplicates exist, the SQL SUM() returning NULL is handled correctly via
+// sql.NullInt64 defaulting to 0.
+func TestCheckDuplicateIssues_ZeroDuplicatesNullHandling(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.Mkdir(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := setupDoltTestDir(t, beadsDir)
+	ctx := context.Background()
+
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("Failed to set issue_prefix: %v", err)
+	}
+
+	// Create unique issues — no duplicates
+	issues := []*types.Issue{
+		{Title: "Issue A", Description: "Unique A", Status: types.StatusOpen, Priority: 1, IssueType: types.TypeTask},
+		{Title: "Issue B", Description: "Unique B", Status: types.StatusOpen, Priority: 1, IssueType: types.TypeTask},
+		{Title: "Issue C", Description: "Unique C", Status: types.StatusOpen, Priority: 1, IssueType: types.TypeTask},
+	}
+
+	for _, issue := range issues {
+		if err := store.CreateIssue(ctx, issue, "test"); err != nil {
+			t.Fatalf("Failed to create issue: %v", err)
+		}
+	}
+
+	store.Close()
+
+	check := CheckDuplicateIssues(tmpDir, false, 1000)
+
+	if check.Status != StatusOK {
+		t.Errorf("Status = %q, want %q (no duplicates should be OK)", check.Status, StatusOK)
+		t.Logf("Message: %s", check.Message)
+	}
+	if check.Message != "No duplicate issues" {
+		t.Errorf("Message = %q, want 'No duplicate issues'", check.Message)
 	}
 }

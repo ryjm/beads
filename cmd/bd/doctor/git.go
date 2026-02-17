@@ -15,7 +15,6 @@ import (
 	"github.com/steveyegge/beads/cmd/bd/doctor/fix"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/git"
-	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/syncbranch"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -36,7 +35,7 @@ const bdInlineHookMarker = "# bd (beads)"
 var bdHooksRunPattern = regexp.MustCompile(`\bbd\s+hooks\s+run\b`)
 
 // CheckGitHooks verifies that recommended git hooks are installed.
-func CheckGitHooks() DoctorCheck {
+func CheckGitHooks(cliVersion string) DoctorCheck {
 	// Check if we're in a git repository using worktree-aware detection
 	hooksDir, err := git.GetGitHooksDir()
 	if err != nil {
@@ -75,6 +74,20 @@ func CheckGitHooks() DoctorCheck {
 		// If the actual hooks are bd shims, they're calling bd regardless of what
 		// the external manager config says (user may have leftover config files)
 		if hasBdShims, bdHooks := areBdShimsInstalled(hooksDir); hasBdShims {
+			if outdated, oldest := findOutdatedBDHookVersions(hooksDir, bdHooks, cliVersion); len(outdated) > 0 {
+				return DoctorCheck{
+					Name:    "Git Hooks",
+					Status:  StatusWarning,
+					Message: "Installed bd hooks are outdated",
+					Detail: fmt.Sprintf(
+						"Outdated: %s (oldest: %s, current: %s)",
+						strings.Join(outdated, ", "),
+						oldest,
+						cliVersion,
+					),
+					Fix: "Run 'bd hooks install --force' to update hooks",
+				}
+			}
 			return DoctorCheck{
 				Name:    "Git Hooks",
 				Status:  StatusOK,
@@ -129,6 +142,20 @@ func CheckGitHooks() DoctorCheck {
 	}
 
 	if len(missingHooks) == 0 {
+		if outdated, oldest := findOutdatedBDHookVersions(hooksDir, installedHooks, cliVersion); len(outdated) > 0 {
+			return DoctorCheck{
+				Name:    "Git Hooks",
+				Status:  StatusWarning,
+				Message: "Installed bd hooks are outdated",
+				Detail: fmt.Sprintf(
+					"Outdated: %s (oldest: %s, current: %s)",
+					strings.Join(outdated, ", "),
+					oldest,
+					cliVersion,
+				),
+				Fix: "Run 'bd hooks install --force' to update hooks",
+			}
+		}
 		return DoctorCheck{
 			Name:    "Git Hooks",
 			Status:  StatusOK,
@@ -156,6 +183,57 @@ func CheckGitHooks() DoctorCheck {
 		Detail:  fmt.Sprintf("Recommended: %s", strings.Join([]string{"pre-commit", "post-merge", "pre-push"}, ", ")),
 		Fix:     hookInstallMsg,
 	}
+}
+
+func findOutdatedBDHookVersions(
+	hooksDir string,
+	hookNames []string,
+	cliVersion string,
+) ([]string, string) {
+	if !IsValidSemver(cliVersion) {
+		return nil, ""
+	}
+	var outdated []string
+	var oldest string
+	for _, hookName := range hookNames {
+		hookPath := filepath.Join(hooksDir, hookName)
+		content, err := os.ReadFile(hookPath)
+		if err != nil {
+			continue
+		}
+		hookVersion, ok := parseBDHookVersion(string(content))
+		if !ok || !IsValidSemver(hookVersion) {
+			continue
+		}
+		if CompareVersions(hookVersion, cliVersion) < 0 {
+			outdated = append(outdated, fmt.Sprintf("%s@%s", hookName, hookVersion))
+			if oldest == "" || CompareVersions(hookVersion, oldest) < 0 {
+				oldest = hookVersion
+			}
+		}
+	}
+	return outdated, oldest
+}
+
+func parseBDHookVersion(content string) (string, bool) {
+	if !strings.Contains(content, "bd-hooks-version:") {
+		return "", false
+	}
+	for _, line := range strings.Split(content, "\n") {
+		if !strings.Contains(line, "bd-hooks-version:") {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			return "", false
+		}
+		version := strings.TrimSpace(parts[1])
+		if version == "" {
+			return "", false
+		}
+		return version, true
+	}
+	return "", false
 }
 
 // areBdShimsInstalled checks if the installed hooks are bd shims, call bd hooks run,
@@ -727,12 +805,12 @@ func CheckSyncBranchHealth(path string) DoctorCheck {
 	mergeBase := strings.TrimSpace(string(mergeBaseOutput))
 	cmd = exec.Command("git", "rev-parse", syncBranch) // #nosec G204 - syncBranch from config
 	cmd.Dir = path
-	localHead, _ := cmd.Output()
+	localHead, _ := cmd.Output() // Best effort: empty output means git check skipped
 	localHeadStr := strings.TrimSpace(string(localHead))
 
 	cmd = exec.Command("git", "rev-parse", remoteBranch) // #nosec G204 - remoteBranch from config
 	cmd.Dir = path
-	remoteHead, _ := cmd.Output()
+	remoteHead, _ := cmd.Output() // Best effort: empty output means git check skipped
 	remoteHeadStr := strings.TrimSpace(string(remoteHead))
 
 	// If merge base equals local but not remote, local is behind
@@ -740,7 +818,7 @@ func CheckSyncBranchHealth(path string) DoctorCheck {
 		// Count how far behind
 		cmd = exec.Command("git", "rev-list", "--count", fmt.Sprintf("%s..%s", syncBranch, remoteBranch)) // #nosec G204 - branches from config
 		cmd.Dir = path
-		countOutput, _ := cmd.Output()
+		countOutput, _ := cmd.Output() // Best effort: empty output means git check skipped
 		behindCount := strings.TrimSpace(string(countOutput))
 
 		return DoctorCheck{
@@ -838,18 +916,18 @@ func CheckGitHooksDoltCompatibility(path string) DoctorCheck {
 	}
 }
 
-// FixGitHooks fixes missing or broken git hooks by calling bd hooks install.
-func FixGitHooks(path string) error {
+// fixGitHooks fixes missing or broken git hooks by calling bd hooks install.
+func fixGitHooks(path string) error {
 	return fix.GitHooks(path)
 }
 
-// FixMergeDriver fixes the git merge driver configuration to use correct placeholders.
-func FixMergeDriver(path string) error {
+// fixMergeDriver fixes the git merge driver configuration to use correct placeholders.
+func fixMergeDriver(path string) error {
 	return fix.MergeDriver(path)
 }
 
-// FixSyncBranchHealth fixes database-JSONL sync issues.
-func FixSyncBranchHealth(path string) error {
+// fixSyncBranchHealth fixes database-JSONL sync issues.
+func fixSyncBranchHealth(path string) error {
 	return fix.DBJSONLSync(path)
 }
 
@@ -948,38 +1026,31 @@ func FindOrphanedIssues(gitPath string, provider types.IssueProvider) ([]OrphanI
 	return orphanedIssues, nil
 }
 
-// FindOrphanedIssuesFromPath is a convenience function for callers that don't have a provider.
-// It creates a local provider from the given path's .beads/ directory.
-// This preserves backward compatibility for CheckOrphanedIssues and similar callers.
-func FindOrphanedIssuesFromPath(path string) ([]OrphanIssue, error) {
-	// Follow redirect to resolve actual beads directory (bd-tvus fix)
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
-
-	// Skip if no .beads directory
-	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
-		return []OrphanIssue{}, nil
-	}
-
-	// Get database path
-	dbPath := filepath.Join(beadsDir, "beads.db")
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		return []OrphanIssue{}, nil
-	}
-
-	// Create a local provider from the database
-	provider, err := storage.NewLocalProvider(dbPath)
-	if err != nil {
-		return []OrphanIssue{}, nil
-	}
-	defer func() { _ = provider.Close() }()
-
-	return FindOrphanedIssues(path, provider)
+// findOrphanedIssuesFromPath is a convenience function for callers that don't have a provider.
+// Note: Cross-repo orphan detection via local database provider has been removed
+// along with the SQLite backend. This function now returns an error; callers
+// should use FindOrphanedIssues with an explicit IssueProvider instead.
+func findOrphanedIssuesFromPath(path string) ([]OrphanIssue, error) {
+	return nil, fmt.Errorf("cross-repo orphan detection requires an explicit IssueProvider (local database provider removed)")
 }
 
 // CheckOrphanedIssues detects issues referenced in git commits but still open.
 // This catches cases where someone implemented a fix with "(bd-xxx)" in the commit
 // message but forgot to run "bd close".
 func CheckOrphanedIssues(path string) DoctorCheck {
+	// Orphaned issue detection requires a local database provider which was removed
+	// during the Dolt-only migration. This check is disabled until reimplemented
+	// against the Dolt store.
+	return DoctorCheck{
+		Name:     "Orphaned Issues",
+		Status:   StatusOK,
+		Message:  "N/A (not yet implemented for Dolt backend)",
+		Category: CategoryGit,
+	}
+
+	// Unreachable: legacy SQLite-based implementation below preserved for reference
+	// during Dolt reimplementation.
+
 	// Skip if not in a git repo (check from path directory)
 	cmd := exec.Command("git", "rev-parse", "--git-dir")
 	cmd.Dir = path
@@ -1016,8 +1087,8 @@ func CheckOrphanedIssues(path string) DoctorCheck {
 		}
 	}
 
-	// Use the shared FindOrphanedIssuesFromPath function (creates its own provider)
-	orphans, err := FindOrphanedIssuesFromPath(path)
+	// Use the shared findOrphanedIssuesFromPath function (creates its own provider)
+	orphans, err := findOrphanedIssuesFromPath(path)
 	if err != nil {
 		return DoctorCheck{
 			Name:     "Orphaned Issues",

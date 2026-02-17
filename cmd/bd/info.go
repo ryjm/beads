@@ -1,9 +1,7 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -14,14 +12,11 @@ import (
 var infoCmd = &cobra.Command{
 	Use:     "info",
 	GroupID: "setup",
-	Short:   "Show database and daemon information",
-	Long: `Display information about the current database path and daemon status.
+	Short:   "Show database information",
+	Long: `Display information about the current database.
 
-This command helps debug issues where bd is using an unexpected database
-or daemon connection. It shows:
+This command helps debug issues where bd is using an unexpected database. It shows:
   - The absolute path to the database file
-  - Daemon connection status (daemon or direct mode)
-  - If using daemon: socket path, health status, version
   - Database statistics (issue count)
   - Schema information (with --schema flag)
   - What's new in recent versions (with --whats-new flag)
@@ -59,72 +54,21 @@ Examples:
 		// Build info structure
 		info := map[string]interface{}{
 			"database_path": absDBPath,
-			"mode":          daemonStatus.Mode,
+			"mode":          "direct",
 		}
 
-		// Add daemon details if connected
-		if daemonClient != nil {
-			info["daemon_connected"] = true
-			info["socket_path"] = daemonStatus.SocketPath
+		// Get issue count from direct store
+		if store != nil {
+			ctx := rootCtx
 
-			// Get daemon health
-			health, err := daemonClient.Health()
+			filter := types.IssueFilter{}
+			issues, err := store.SearchIssues(ctx, "", filter)
 			if err == nil {
-				info["daemon_version"] = health.Version
-				info["daemon_status"] = health.Status
-				info["daemon_compatible"] = health.Compatible
-				info["daemon_uptime"] = health.Uptime
-			}
-
-			// Get issue count from daemon
-			resp, err := daemonClient.Stats()
-			if err == nil {
-				var stats types.Statistics
-				if jsonErr := json.Unmarshal(resp.Data, &stats); jsonErr == nil {
-					info["issue_count"] = stats.TotalIssues
-				}
-			}
-		} else {
-			// Direct mode
-			info["daemon_connected"] = false
-			if daemonStatus.FallbackReason != "" && daemonStatus.FallbackReason != FallbackNone {
-				info["daemon_fallback_reason"] = daemonStatus.FallbackReason
-			}
-			if daemonStatus.Detail != "" {
-				info["daemon_detail"] = daemonStatus.Detail
-			}
-
-			// Get issue count from direct store
-			if store != nil {
-				ctx := rootCtx
-
-				// Check database freshness before reading
-				// Skip check when using daemon (daemon auto-imports on staleness)
-				if daemonClient == nil {
-					if err := ensureDatabaseFresh(ctx); err != nil {
-						fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-						os.Exit(1)
-					}
-				}
-
-				filter := types.IssueFilter{}
-				issues, err := store.SearchIssues(ctx, "", filter)
-				if err == nil {
-					info["issue_count"] = len(issues)
-				}
+				info["issue_count"] = len(issues)
 			}
 		}
 
-		// Add config to info output (requires direct mode to access config table)
-		// Save current daemon state
-		wasDaemon := daemonClient != nil
-		var tempErr error
-
-		if wasDaemon {
-			// Temporarily switch to direct mode to read config
-			tempErr = ensureDirectMode("info: reading config")
-		}
-
+		// Add config to info output
 		if store != nil {
 			ctx := rootCtx
 			configMap, err := store.GetAllConfig(ctx)
@@ -132,10 +76,6 @@ Examples:
 				info["config"] = configMap
 			}
 		}
-
-		// Note: We don't restore daemon mode since info is a read-only command
-		// and the process will exit immediately after this
-		_ = tempErr // silence unused warning
 
 		// Add schema information if requested
 		if schemaFlag && store != nil {
@@ -152,7 +92,7 @@ Examples:
 
 			// Get config
 			configMap := make(map[string]string)
-			prefix, _ := store.GetConfig(ctx, "issue_prefix")
+			prefix, _ := store.GetConfig(ctx, "issue_prefix") // Best effort: empty prefix is valid
 			if prefix != "" {
 				configMap["issue_prefix"] = prefix
 			}
@@ -196,34 +136,7 @@ Examples:
 		fmt.Println("\nBeads Database Information")
 		fmt.Println("===========================")
 		fmt.Printf("Database: %s\n", absDBPath)
-		fmt.Printf("Mode: %s\n", daemonStatus.Mode)
-
-		if daemonClient != nil {
-			fmt.Println("\nDaemon Status:")
-			fmt.Printf("  Connected: yes\n")
-			fmt.Printf("  Socket: %s\n", daemonStatus.SocketPath)
-
-			health, err := daemonClient.Health()
-			if err == nil {
-				fmt.Printf("  Version: %s\n", health.Version)
-				fmt.Printf("  Health: %s\n", health.Status)
-				if health.Compatible {
-					fmt.Printf("  Compatible: ✓ yes\n")
-				} else {
-					fmt.Printf("  Compatible: ✗ no (restart recommended)\n")
-				}
-				fmt.Printf("  Uptime: %.1fs\n", health.Uptime)
-			}
-		} else {
-			fmt.Println("\nDaemon Status:")
-			fmt.Printf("  Connected: no\n")
-			if daemonStatus.FallbackReason != "" && daemonStatus.FallbackReason != FallbackNone {
-				fmt.Printf("  Reason: %s\n", daemonStatus.FallbackReason)
-			}
-			if daemonStatus.Detail != "" {
-				fmt.Printf("  Detail: %s\n", daemonStatus.Detail)
-			}
-		}
+		fmt.Printf("Mode: direct\n")
 
 		// Show issue count
 		if count, ok := info["issue_count"].(int); ok {
@@ -296,6 +209,122 @@ type VersionChange struct {
 
 // versionChanges contains agent-actionable changes for recent versions
 var versionChanges = []VersionChange{
+	{
+		Version: "0.52.0",
+		Date:    "2026-02-16",
+		Changes: []string{
+			"NEW: bd ready --include-ephemeral flag to include ephemeral issues in ready work",
+			"FIX: Doctor redirect target resolution (#1803)",
+			"FIX: Guard dolt directory creation with server-mode check (#1800)",
+			"FIX: Tilde expansion in core.hooksPath on Windows (#1798)",
+			"FIX: Worktree redirect path resolution from worktree root (#1791)",
+			"FIX: Block rename-prefix in git worktrees (#1792)",
+			"REMOVED: Dead git-portable sync functions (#1793)",
+		},
+	},
+	{
+		Version: "0.51.0",
+		Date:    "2026-02-16",
+		Changes: []string{
+			"REMOVED: Dolt-native cleanup — removed SQLite backend, JSONL sync, 3-way merge, tombstones, storage factory, daemon stubs (8-phase refactor)",
+			"CHANGED: bd sync is now a no-op — Dolt handles persistence directly",
+			"FIX: Dolt config test corruption in worktree environments (t.Setenv fix)",
+			"FIX: Batch DeleteIssues hang on large ID sets with correctness hardening",
+			"FIX: bd mol current step readiness uses analyzeMoleculeParallel",
+			"FIX: bd doctor AccessLock integration, --yes for repo fingerprint",
+			"FIX: GetReadyWork excludes workflow/identity types",
+			"PERF: CASCADE deletes cut deletion queries by 60%",
+			"PERF: Schema init skip when already at current version",
+			"DOCS: 10+ docs updated from SQLite to Dolt, deprecated docs removed",
+		},
+	},
+	{
+		Version: "0.50.3",
+		Date:    "2026-02-15",
+		Changes: []string{
+			"REFACTOR: All tracker CLIs (Linear, GitLab, Jira) now use shared SyncEngine — eliminates ~800 lines of duplicated sync code",
+			"NEW: SyncEngine PullHooks/PushHooks for tracker-specific behaviors (GenerateID, FormatDescription, ContentEqual, etc.)",
+			"NEW: Jira native integration in internal/jira/ with REST API v3, ADF conversion, field mapping",
+			"NEW: Tracker plugin registry with auto-discovery (tracker.Register + init())",
+			"FIX: Jira State mapping bug — stale pointer assignment could cause incorrect status mapping",
+			"FIX: CI Windows build — test helper file renamed to _test.go suffix",
+			"PERF: Test suite — cached git template replaces ~60 subprocess calls",
+		},
+	},
+	{
+		Version: "0.50.1",
+		Date:    "2026-02-14",
+		Changes: []string{
+			"CHANGED: Default backend is now Dolt for new bd init projects (existing SQLite projects unaffected)",
+			"NEW: bd graph terminal-native DAG visualization, DOT export, interactive HTML export",
+			"NEW: bd sql command for raw SQL access (table, JSON, CSV output)",
+			"NEW: bd help --all for complete command reference dump",
+			"NEW: decision built-in issue type",
+			"NEW: Cross-database dependency resolution via prefix routes in bd show/graph/blocked",
+			"NEW: bd doctor artifact cleanup (--check=artifacts --clean) and Dolt corruption recovery (--fix)",
+			"NEW: bd doctor Claude Code integration checks and grouped category output",
+			"REMOVED: Daemon/RPC subsystem and JSONL sync layer fully removed",
+			"FIX: bd close enforces gate satisfaction (--force to bypass)",
+			"FIX: bd show exits non-zero when issue not found",
+			"FIX: Dolt joinIter panic prevented (replaced IN/EXISTS subqueries with Go-level filtering)",
+			"FIX: Embedded Dolt self-deadlock in git hooks and bd migrate",
+			"FIX: bd ready excludes children of deferred parents",
+		},
+	},
+	{
+		Version: "0.49.6",
+		Date:    "2026-02-09",
+		Changes: []string{
+			"REVERT: Embedded Dolt mode restored (removal was only intended for Gas Town, not Beads)",
+			"REMOVED: Daemon subsystem fully removed from bd CLI (Dolt replaces daemon-based sync)",
+			"REMOVED: JSONL flush/sync machinery deleted (-7,634 lines); JSONL functions are now no-ops",
+			"CLEANUP: Removed 171 dead daemonClient branches and 46 markDirtyAndScheduleFlush no-op calls",
+		},
+	},
+	{
+		Version: "0.49.5",
+		Date:    "2026-02-08",
+		Changes: []string{
+			"NEW: bd search --has/--no flags for content and null-check filtering",
+			"NEW: bd promote command for wisp-to-bead promotion",
+			"NEW: bd todo command for lightweight task management",
+			"NEW: bd find-duplicates for AI-powered duplicate detection",
+			"NEW: bd validate integrated into bd doctor --check=validate",
+			"NEW: Dolt fail-fast TCP check before MySQL protocol init",
+			"SECURITY: SQL identifier validation prevents injection in dynamic table/db names",
+			"SECURITY: Path traversal fix in export handler; command injection fix in import",
+			"FIX: RPC mutation events now include issueID (was zero-value for label/dep ops)",
+			"FIX: Daemon YAML config recognizes both hyphen and underscore variants",
+			"FIX: Doctor role check falls back to database config",
+			"FIX: SQLite Close() idempotent (WAL retry deadlock fix)",
+			"FIX: SQLITE_BUSY retry for all BEGIN IMMEDIATE calls",
+			"FIX: Dolt cross-rig contamination prevented with prefix-based db names",
+			"FIX: bd list separates parent-child from blocks display",
+			"FIX: Cross-prefix ID resolution in multi-repo scenarios",
+			"CHANGE: Embedded Dolt mode fully removed (server-only connections)",
+			"CHANGE: bd init defaults to chaining hooks (no prompt)",
+			"CHANGE: brew upgrade command corrected to 'brew upgrade beads'",
+		},
+	},
+	{
+		Version: "0.49.4",
+		Date:    "2026-02-05",
+		Changes: []string{
+			"NEW: --label-pattern and --label-regex flags for bd list and bd ready - glob and regex filtering on labels",
+			"NEW: Simple query language for complex bd list filtering",
+			"NEW: spec_id field for linking issues to specification documents",
+			"NEW: Wisp type field for TTL-based compaction of ephemeral molecules",
+			"NEW: Dolt schema migration runner and doctor validation checks",
+			"NEW: --metadata flag for bd update (JSON metadata from CLI)",
+			"NEW: config.local.yaml for local configuration overrides",
+			"FIX: JSONL file locking prevents race conditions in concurrent writes",
+			"FIX: Merge driver preserves all issue fields (spec_id, metadata, deps)",
+			"FIX: Atomic bd claim with compare-and-swap semantics",
+			"FIX: Dolt lock contention - advisory flock prevents zombie processes",
+			"FIX: Windows Dolt build via pure-Go regex backend",
+			"CHANGE: bd ready excludes in_progress issues (shows only claimable work)",
+		},
+	},
 	{
 		Version: "0.49.3",
 		Date:    "2026-01-31",
@@ -390,7 +419,7 @@ var versionChanges = []VersionChange{
 		Version: "0.47.2",
 		Date:    "2026-01-14",
 		Changes: []string{
-			"NEW: Dolt backend (experimental) - bd init --backend=dolt for version-controlled storage",
+			"NEW: Dolt backend - version-controlled storage with bd init",
 			"NEW: bd show --children flag - Display child issues inline with parent",
 			"NEW: Comprehensive NixOS support - Improved flake and home-manager integration",
 			"FIX: Redirect + sync-branch incompatibility - bd sync works in redirected repos (bd-wayc3)",
@@ -529,7 +558,6 @@ var versionChanges = []VersionChange{
 		Changes: []string{
 			"NEW: bd swarm commands - Create/status/validate for multi-agent batch coordination",
 			"NEW: bd repair command - Detect and repair orphaned foreign key references",
-			"NEW: bd compact --purge-tombstones - Dependency-aware tombstone cleanup",
 			"NEW: bd init --from-jsonl - Preserve manual JSONL edits on reinit",
 			"NEW: bd human command - Focused help menu for humans",
 			"NEW: bd show --short - Compact output mode for scripting",
@@ -633,7 +661,7 @@ var versionChanges = []VersionChange{
 			"CHANGED: bd mol run removed - Orchestration moved to gt commands",
 			"CHANGED: Wisp architecture simplified - Single DB with Wisp=true flag",
 			"FIX: Gate await fields preserved during upsert - Multirepo sync fix",
-			"FIX: Tombstones retain closed_at timestamp - Preserves close time in soft deletes",
+			"FIX: closed_at timestamp preserved during soft deletes",
 			"FIX: Git detection caching - Eliminates worktree slowness",
 			"FIX: installed_plugins.json v2 format - bd doctor handles new Claude Code format",
 			"FIX: git.IsWorktree() hang on Windows - bd init no longer hangs outside git repos",
@@ -655,7 +683,6 @@ var versionChanges = []VersionChange{
 			"NEW: Gate issue type - bd gate create/open/close for async coordination",
 			"NEW: bd list --pretty --watch - Built-in colorized viewer with live updates",
 			"NEW: bd search --after/--before/--priority/--content - Enhanced search filters",
-			"NEW: bd compact --prune - Standalone tombstone pruning",
 			"NEW: bd export --priority - Exact priority filter for exports",
 			"NEW: --resolution alias for --reason on bd close",
 			"NEW: Config-based close hooks - Custom scripts on issue close",
@@ -806,7 +833,7 @@ var versionChanges = []VersionChange{
 			"bd template instantiate - Create beads issues from Beads templates",
 			"--assignee flag for template instantiate - Auto-assign during instantiation",
 			"bd mail inbox --identity fix - Now properly filters by identity parameter",
-			"Orphan detection fixes - No longer warns about closed issues or tombstones",
+			"Orphan detection fixes - No longer warns about closed issues",
 			"EXPERIMENTAL: Graph link fields (relates_to, replies_to, duplicate_of, superseded_by) and mail commands are subject to breaking changes",
 		},
 	},
@@ -828,7 +855,7 @@ var versionChanges = []VersionChange{
 			"New dependency types: replies-to, relates-to, duplicates, supersedes",
 			"Windows build fixes - gosec lint errors resolved",
 			"Issue ID prefix extraction fix - Word-like suffixes now parse correctly",
-			"Legacy deletions.jsonl code removed - Fully migrated to inline tombstones",
+			"Legacy deletions.jsonl code removed - Dolt handles delete propagation natively",
 		},
 	},
 	{
@@ -841,8 +868,6 @@ var versionChanges = []VersionChange{
 			"bd show displays dependent issue status - Shows status for blocked-by/blocking issues",
 			"claude.local.md support - Local-only documentation, gitignored by default",
 			"Auto-disable daemon in git worktrees - Prevents database conflicts",
-			"Inline tombstones for soft-delete - Deleted issues become tombstones in issues.jsonl",
-			"bd migrate-tombstones command - Converts legacy deletions.jsonl to inline tombstones",
 			"Enhanced Git Worktree Support - Shared .beads database across worktrees",
 		},
 	},
@@ -850,9 +875,6 @@ var versionChanges = []VersionChange{
 		Version: "0.30.0",
 		Date:    "2025-12-15",
 		Changes: []string{
-			"TOMBSTONE ARCHITECTURE - Deleted issues become inline tombstones in issues.jsonl",
-			"bd migrate-tombstones - Convert legacy deletions.jsonl to inline tombstones",
-			"bd doctor tombstone health checks - Detects orphaned/expired tombstones",
 			"Git Worktree Support - Shared database across worktrees, worktree-aware hooks",
 			"MCP Context Engineering - 80-90% context reduction for MCP responses",
 			"bd thanks command - List contributors to your project",

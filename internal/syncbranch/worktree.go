@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/git"
-	"github.com/steveyegge/beads/internal/merge"
 	"github.com/steveyegge/beads/internal/utils"
 )
 
@@ -67,25 +66,25 @@ func EnsureWorktree(ctx context.Context) (string, error) {
 
 // CommitResult contains information about a worktree commit operation
 type CommitResult struct {
-	Committed  bool   // True if changes were committed
-	Pushed     bool   // True if changes were pushed
-	Branch     string // The sync branch name
-	Message    string // Commit message used
+	Committed bool   // True if changes were committed
+	Pushed    bool   // True if changes were pushed
+	Branch    string // The sync branch name
+	Message   string // Commit message used
 }
 
-// DivergenceInfo contains information about sync branch divergence from remote
-type DivergenceInfo struct {
-	LocalAhead   int    // Number of commits local is ahead of remote
-	RemoteAhead  int    // Number of commits remote is ahead of local
-	Branch       string // The sync branch name
-	Remote       string // The remote name (e.g., "origin")
-	IsDiverged   bool   // True if both local and remote have commits the other doesn't
-	IsSignificant bool  // True if divergence exceeds threshold (suggests recovery needed)
+// divergenceInfo contains information about sync branch divergence from remote
+type divergenceInfo struct {
+	LocalAhead    int    // Number of commits local is ahead of remote
+	RemoteAhead   int    // Number of commits remote is ahead of local
+	Branch        string // The sync branch name
+	Remote        string // The remote name (e.g., "origin")
+	IsDiverged    bool   // True if both local and remote have commits the other doesn't
+	IsSignificant bool   // True if divergence exceeds threshold (suggests recovery needed)
 }
 
-// SignificantDivergenceThreshold is the number of commits at which divergence is considered significant
+// significantDivergenceThreshold is the number of commits at which divergence is considered significant
 // When both local and remote are ahead by at least this many commits, the user should consider recovery options
-const SignificantDivergenceThreshold = 5
+const significantDivergenceThreshold = 5
 
 // PullResult contains information about a worktree pull operation
 type PullResult struct {
@@ -246,11 +245,9 @@ func preemptiveFetchAndFastForward(ctx context.Context, worktreePath, branch, re
 // a content-based merge instead of relying on git's commit-level merge. When local and remote
 // sync branches have diverged:
 //  1. Fetch remote changes (don't pull)
-//  2. Find the merge base
-//  3. Extract JSONL from base, local, and remote
-//  4. Perform 3-way content merge using bd's merge algorithm
-//  5. Reset to remote's history (adopt remote commit graph)
-//  6. Commit merged content on top
+//  2. Extract JSONL from remote
+//  3. Reset to remote's history (adopt remote commit graph)
+//  4. Commit merged content on top
 //
 // IMPORTANT: After successful content merge, auto-pushes to remote by default.
 // Includes safety check: warns (but doesn't block) if >50% issues vanished AND >5 existed.
@@ -258,7 +255,7 @@ func preemptiveFetchAndFastForward(ctx context.Context, worktreePath, branch, re
 //
 // IMPORTANT: If requireMassDeleteConfirmation is true and the safety check triggers,
 // the function will NOT auto-push. Instead, it sets SafetyCheckTriggered=true in the result
-// and the caller should prompt for confirmation then call PushSyncBranch.
+// and the caller should prompt for confirmation then call pushSyncBranch.
 //
 // This ensures sync never fails due to git merge conflicts, as we handle merging at the
 // JSONL content level where we have semantic understanding of the data.
@@ -328,7 +325,7 @@ func PullFromSyncBranch(ctx context.Context, repoRoot, syncBranch, jsonlPath str
 		// GH#1173: Do NOT copy uncommitted worktree changes to main repo.
 		// The worktree may have uncommitted changes from previous exports that
 		// haven't been committed yet. Copying those to main would make local
-		// data appear as "remote" data, corrupting the 3-way merge.
+		// data appear as "remote" data, corrupting the content merge.
 		// Instead, copy only the COMMITTED state from the worktree.
 		if err := copyCommittedJSONLToMainRepo(ctx, worktreePath, jsonlRelPath, jsonlPath); err != nil {
 			return nil, err
@@ -354,12 +351,11 @@ func PullFromSyncBranch(ctx context.Context, repoRoot, syncBranch, jsonlPath str
 		return result, nil
 	}
 
-	// Case 3: DIVERGED - perform content-based merge
-	// This is the key fix: instead of git merge (which can fail), we:
-	// 1. Extract JSONL content from base, local, and remote
-	// 2. Merge at content level using our 3-way merge algorithm
-	// 3. Reset to remote's commit history
-	// 4. Commit merged content on top
+	// Case 3: DIVERGED - take remote content (remote-wins strategy)
+	// Instead of git merge (which can fail), we:
+	// 1. Extract JSONL content from remote
+	// 2. Reset to remote's commit history
+	// 3. Commit merged content on top
 
 	// Extract local content before merge for safety check
 	localContent, extractErr := extractJSONLFromCommit(ctx, worktreePath, "HEAD", jsonlRelPath)
@@ -369,10 +365,7 @@ func PullFromSyncBranch(ctx context.Context, repoRoot, syncBranch, jsonlPath str
 			fmt.Sprintf("⚠️  Warning: Could not extract local content for safety check: %v", extractErr))
 	}
 
-	mergedContent, err := performContentMerge(ctx, worktreePath, syncBranch, remote, jsonlRelPath)
-	if err != nil {
-		return nil, fmt.Errorf("content merge failed: %w", err)
-	}
+	mergedContent := performContentMerge(ctx, worktreePath, syncBranch, remote, jsonlRelPath)
 
 	// Reset worktree to remote's history (adopt their commit graph)
 	resetCmd := exec.CommandContext(ctx, "git", "-C", worktreePath, "reset", "--hard",
@@ -502,7 +495,7 @@ func getDivergence(ctx context.Context, worktreePath, branch, remote string) (in
 	return localAhead, remoteAhead, nil
 }
 
-// CheckDivergence checks the divergence between local sync branch and remote.
+// checkDivergence checks the divergence between local sync branch and remote.
 // This should be called before attempting sync operations to detect significant divergence
 // that may require user intervention.
 //
@@ -511,9 +504,9 @@ func getDivergence(ctx context.Context, worktreePath, branch, remote string) (in
 //   - repoRoot: Path to the git repository root
 //   - syncBranch: Name of the sync branch (e.g., "beads-sync")
 //
-// Returns DivergenceInfo with details about the divergence, or error if check fails.
-func CheckDivergence(ctx context.Context, repoRoot, syncBranch string) (*DivergenceInfo, error) {
-	info := &DivergenceInfo{
+// Returns divergenceInfo with details about the divergence, or error if check fails.
+func checkDivergence(ctx context.Context, repoRoot, syncBranch string) (*divergenceInfo, error) {
+	info := &divergenceInfo{
 		Branch: syncBranch,
 	}
 
@@ -555,14 +548,14 @@ func CheckDivergence(ctx context.Context, repoRoot, syncBranch string) (*Diverge
 
 	// Significant divergence: both sides have many commits
 	// This suggests automatic merge may be problematic
-	if info.IsDiverged && (localAhead >= SignificantDivergenceThreshold || remoteAhead >= SignificantDivergenceThreshold) {
+	if info.IsDiverged && (localAhead >= significantDivergenceThreshold || remoteAhead >= significantDivergenceThreshold) {
 		info.IsSignificant = true
 	}
 
 	return info, nil
 }
 
-// ResetToRemote resets the local sync branch to match the remote state.
+// resetToRemote resets the local sync branch to match the remote state.
 // This discards all local commits on the sync branch and adopts the remote's history.
 // Use this when the sync branch has diverged significantly and you want to discard local changes.
 //
@@ -573,7 +566,7 @@ func CheckDivergence(ctx context.Context, repoRoot, syncBranch string) (*Diverge
 //   - jsonlPath: Path to the JSONL file in the main repo (will be updated with remote content)
 //
 // Returns error if reset fails.
-func ResetToRemote(ctx context.Context, repoRoot, syncBranch, jsonlPath string) error {
+func resetToRemote(ctx context.Context, repoRoot, syncBranch, jsonlPath string) error {
 	// GH#639: Use git-common-dir for worktree path to support bare repos
 	worktreePath := getBeadsWorktreePath(ctx, repoRoot, syncBranch)
 
@@ -615,90 +608,16 @@ func ResetToRemote(ctx context.Context, repoRoot, syncBranch, jsonlPath string) 
 	return nil
 }
 
-// performContentMerge extracts JSONL from base, local, and remote, then merges content.
-// Returns the merged JSONL content.
-func performContentMerge(ctx context.Context, worktreePath, branch, remote, jsonlRelPath string) ([]byte, error) {
-	// Find merge base
-	mergeBaseCmd := exec.CommandContext(ctx, "git", "-C", worktreePath, "merge-base",
-		"HEAD", fmt.Sprintf("%s/%s", remote, branch))
-	mergeBaseOutput, err := mergeBaseCmd.Output()
-	if err != nil {
-		// No common ancestor - treat as empty base
-		mergeBaseOutput = nil
-	}
-	mergeBase := strings.TrimSpace(string(mergeBaseOutput))
-
-	// Create temp files for 3-way merge
-	tmpDir, err := os.MkdirTemp("", "bd-merge-*")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp dir: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
-	baseFile := filepath.Join(tmpDir, "base.jsonl")
-	localFile := filepath.Join(tmpDir, "local.jsonl")
-	remoteFile := filepath.Join(tmpDir, "remote.jsonl")
-	outputFile := filepath.Join(tmpDir, "merged.jsonl")
-
-	// Extract base JSONL (may not exist if this is first divergence)
-	if mergeBase != "" {
-		baseContent, err := extractJSONLFromCommit(ctx, worktreePath, mergeBase, jsonlRelPath)
-		if err != nil {
-			// Base file might not exist in ancestor - use empty file
-			baseContent = []byte{}
-		}
-		if err := os.WriteFile(baseFile, baseContent, 0600); err != nil {
-			return nil, fmt.Errorf("failed to write base file: %w", err)
-		}
-	} else {
-		// No merge base - use empty file
-		if err := os.WriteFile(baseFile, []byte{}, 0600); err != nil {
-			return nil, fmt.Errorf("failed to write empty base file: %w", err)
-		}
-	}
-
-	// Extract local JSONL (current HEAD in worktree)
-	localContent, err := extractJSONLFromCommit(ctx, worktreePath, "HEAD", jsonlRelPath)
-	if err != nil {
-		// Local file might not exist - use empty
-		localContent = []byte{}
-	}
-	if err := os.WriteFile(localFile, localContent, 0600); err != nil {
-		return nil, fmt.Errorf("failed to write local file: %w", err)
-	}
-
-	// Extract remote JSONL
+// performContentMerge extracts JSONL from remote and returns it.
+// When sync branches diverge, we take remote content since the caller
+// resets to remote's commit graph anyway.
+func performContentMerge(ctx context.Context, worktreePath, branch, remote, jsonlRelPath string) []byte {
 	remoteRef := fmt.Sprintf("%s/%s", remote, branch)
 	remoteContent, err := extractJSONLFromCommit(ctx, worktreePath, remoteRef, jsonlRelPath)
 	if err != nil {
-		// Remote file might not exist - use empty
 		remoteContent = []byte{}
 	}
-	if err := os.WriteFile(remoteFile, remoteContent, 0600); err != nil {
-		return nil, fmt.Errorf("failed to write remote file: %w", err)
-	}
-
-	// Perform 3-way merge using bd's merge algorithm
-	// The merge function writes to outputFile (first arg) and returns error if conflicts
-	err = merge.Merge3Way(outputFile, baseFile, localFile, remoteFile, false)
-	if err != nil {
-		// Check if it's a conflict error
-		if strings.Contains(err.Error(), "merge completed with") {
-			// There were conflicts - this is rare for JSONL since most fields can be
-			// auto-merged. When it happens, it means both sides changed the same field
-			// to different values. We fail here rather than writing corrupt JSONL.
-			return nil, fmt.Errorf("merge conflict: %w (manual resolution required)", err)
-		}
-		return nil, fmt.Errorf("3-way merge failed: %w", err)
-	}
-
-	// Read merged result
-	mergedContent, err := os.ReadFile(outputFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read merged file: %w", err)
-	}
-
-	return mergedContent, nil
+	return remoteContent
 }
 
 // extractJSONLFromCommit extracts a file's content from a specific git commit.
@@ -714,7 +633,7 @@ func extractJSONLFromCommit(ctx context.Context, worktreePath, commit, filePath 
 
 // copyCommittedJSONLToMainRepo copies the COMMITTED JSONL from worktree to main repo.
 // GH#1173: This extracts the file from HEAD rather than the working directory,
-// ensuring uncommitted local changes don't corrupt the 3-way merge.
+// ensuring uncommitted local changes don't corrupt the content merge.
 func copyCommittedJSONLToMainRepo(ctx context.Context, worktreePath, jsonlRelPath, jsonlPath string) error {
 	// GH#785: Handle bare repo worktrees
 	normalizedRelPath := normalizeBeadsRelPath(jsonlRelPath)
@@ -841,18 +760,17 @@ func isNonFastForwardError(output string) bool {
 
 // contentMergeRecovery performs a content-level merge when push fails due to divergence.
 //
-// The problem with git rebase: it replays commits textually, which can resurrect
-// tombstones. For example, if remote has a tombstone and local has 'closed',
-// the rebase overwrites the tombstone with 'closed'.
+// The problem with git rebase: it replays commits textually, which can overwrite
+// remote changes. For example, if remote has updated content and local has stale data,
+// the rebase overwrites the remote update with the local version.
 //
-// This function uses the same content-level merge as PullFromSyncBranch:
+// This function uses a remote-wins strategy:
 // 1. Fetch remote
-// 2. Find merge base
-// 3. Extract JSONL from base, local, remote
-// 4. Run 3-way content merge (respects tombstones)
-// 5. Reset to remote, commit merged content
+// 2. Extract JSONL from remote
+// 3. Use remote content as the merged result (remote-wins)
+// 4. Reset to remote, commit merged content
 //
-// This fixes a sync race where rebase-based divergence recovery resurrects tombstones.
+// This fixes a sync race where rebase-based divergence recovery overwrites remote changes.
 func contentMergeRecovery(ctx context.Context, worktreePath, branch, remote string) error {
 	// The JSONL is always at .beads/issues.jsonl relative to worktree
 	jsonlRelPath := filepath.Join(".beads", "issues.jsonl")
@@ -864,10 +782,7 @@ func contentMergeRecovery(ctx context.Context, worktreePath, branch, remote stri
 	}
 
 	// Step 2: Perform content-level merge (same algorithm as PullFromSyncBranch)
-	mergedContent, err := performContentMerge(ctx, worktreePath, branch, remote, jsonlRelPath)
-	if err != nil {
-		return fmt.Errorf("content merge failed: %w", err)
-	}
+	mergedContent := performContentMerge(ctx, worktreePath, branch, remote, jsonlRelPath)
 
 	// Step 3: Reset worktree to remote's history (adopt their commit graph)
 	resetCmd := exec.CommandContext(ctx, "git", "-C", worktreePath, "reset", "--hard",
@@ -901,7 +816,6 @@ func contentMergeRecovery(ctx context.Context, worktreePath, branch, remote stri
 
 	return nil
 }
-
 
 // runCmdWithTimeoutMessage runs a command and prints a helpful message if it takes too long.
 // This helps when git operations hang waiting for credential/browser auth.
@@ -964,7 +878,7 @@ func pushFromWorktree(ctx context.Context, worktreePath, branch string) error {
 		// Check if this is a non-fast-forward error (concurrent push conflict)
 		if isNonFastForwardError(outputStr) {
 			// Use content-level merge instead of git rebase.
-			// Git rebase is text-level and can resurrect tombstones.
+			// Git rebase is text-level and can overwrite remote changes.
 			if mergeErr := contentMergeRecovery(ctx, worktreePath, branch, remote); mergeErr != nil {
 				// Content merge failed - provide clear recovery options
 				return fmt.Errorf(`sync branch diverged and automatic recovery failed
@@ -1001,7 +915,7 @@ Merge error: %v`, branch, remote, branch, branch, lastErr, mergeErr)
 	return fmt.Errorf("push failed after %d attempts: %w", maxRetries, lastErr)
 }
 
-// PushSyncBranch pushes the sync branch to remote.
+// pushSyncBranch pushes the sync branch to remote.
 // This is used after confirmation when sync.require_confirmation_on_mass_delete is enabled
 // and a mass deletion was detected during merge.
 //
@@ -1011,9 +925,10 @@ Merge error: %v`, branch, remote, branch, branch, lastErr, mergeErr)
 //   - syncBranch: Name of the sync branch (e.g., "beads-sync")
 //
 // Returns error if push fails.
-func PushSyncBranch(ctx context.Context, repoRoot, syncBranch string) error {
-	// Worktree path is under .git/beads-worktrees/<branch>
-	worktreePath := filepath.Join(repoRoot, ".git", "beads-worktrees", syncBranch)
+func pushSyncBranch(ctx context.Context, repoRoot, syncBranch string) error {
+	// GH#bd-n3v: Use getBeadsWorktreePath instead of hardcoding .git path.
+	// When run from a git worktree, .git is a file, not a directory.
+	worktreePath := getBeadsWorktreePath(ctx, repoRoot, syncBranch)
 
 	// Recreate worktree if it was cleaned up, using the same pattern as CommitToSyncBranch
 	wtMgr := git.NewWorktreeManager(repoRoot)

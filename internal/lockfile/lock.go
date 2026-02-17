@@ -2,6 +2,7 @@ package lockfile
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,10 @@ import (
 
 // ErrLocked is returned when a lock cannot be acquired because it is held by another process.
 var ErrLocked = errDaemonLocked
+
+// ErrLockBusy is returned when a non-blocking lock cannot be acquired
+// because another process holds a conflicting lock.
+var ErrLockBusy = errors.New("lock busy: held by another process")
 
 // IsLocked returns true if the error indicates a lock is held by another process.
 func IsLocked(err error) bool {
@@ -44,24 +49,24 @@ func TryDaemonLock(beadsDir string) (running bool, pid int) {
 		// Fall back to PID file check for backward compatibility
 		return checkPIDFile(beadsDir)
 	}
-	defer func() { _ = f.Close() }()
+	defer func() { _ = f.Close() }() // Best effort: file close in defer after use
 
 	// Try to acquire lock non-blocking
 	if err := flockExclusive(f); err != nil {
 		if err == errDaemonLocked {
 			// Lock is held - daemon is running
 			// Try to read PID from JSON format (best effort)
-			_, _ = f.Seek(0, 0)
+			_, _ = f.Seek(0, 0) // Best effort: seek failure means we fall through to PID file check
 			var lockInfo LockInfo
 			if err := json.NewDecoder(f).Decode(&lockInfo); err == nil {
 				pid = lockInfo.PID
 			} else {
 				// Fallback: try reading as plain integer (old format)
-				_, _ = f.Seek(0, 0)
+				_, _ = f.Seek(0, 0) // Best effort: seek failure means we fall through to PID file check
 				data := make([]byte, 32)
 				n, _ := f.Read(data)
 				if n > 0 {
-					_, _ = fmt.Sscanf(string(data[:n]), "%d", &pid)
+					_, _ = fmt.Sscanf(string(data[:n]), "%d", &pid) // Best effort: parse failure means pid stays 0, triggers PID file fallback
 				}
 				// Fallback to PID file if we couldn't read PID from lock file
 				if pid == 0 {
@@ -105,13 +110,13 @@ func checkPIDFile(beadsDir string) (running bool, pid int) {
 // Returns lock info if available, or error if file doesn't exist or can't be parsed
 func ReadLockInfo(beadsDir string) (*LockInfo, error) {
 	lockPath := filepath.Join(beadsDir, "daemon.lock")
-	
+
 	// #nosec G304 - controlled path from config
 	data, err := os.ReadFile(lockPath)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	var lockInfo LockInfo
 	if err := json.Unmarshal(data, &lockInfo); err != nil {
 		// Try parsing as old format (plain PID)
@@ -121,6 +126,6 @@ func ReadLockInfo(beadsDir string) (*LockInfo, error) {
 		}
 		return nil, fmt.Errorf("cannot parse lock file: %w", err)
 	}
-	
+
 	return &lockInfo, nil
 }

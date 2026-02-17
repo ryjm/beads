@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads"
 	"github.com/steveyegge/beads/internal/rpc"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -150,7 +150,7 @@ func connectToDaemon(socketPath, dbPath string) error {
 	// Check daemon health
 	health, err := client.Health()
 	if err != nil || health.Status != "healthy" {
-		_ = client.Close()
+		_ = client.Close() // Best effort cleanup on error path
 		if err != nil {
 			return fmt.Errorf("daemon health check failed: %v", err)
 		}

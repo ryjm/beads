@@ -28,11 +28,11 @@ func TestGetDependenciesWithMetadata_NoResults(t *testing.T) {
 
 	// Create an issue with no dependencies
 	issue := &types.Issue{
-		ID:          "no-deps-issue",
-		Title:       "No Dependencies",
-		Status:      types.StatusOpen,
-		Priority:    2,
-		IssueType:   types.TypeTask,
+		ID:        "no-deps-issue",
+		Title:     "No Dependencies",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
 	}
 	if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
 		t.Fatalf("failed to create issue: %v", err)
@@ -429,25 +429,30 @@ func TestDetectCycles_WithCycle(t *testing.T) {
 		}
 	}
 
-	// Create cycle
-	deps := []*types.Dependency{
-		{IssueID: issueA.ID, DependsOnID: issueB.ID, Type: types.DepBlocks},
-		{IssueID: issueB.ID, DependsOnID: issueC.ID, Type: types.DepBlocks},
-		{IssueID: issueC.ID, DependsOnID: issueA.ID, Type: types.DepBlocks}, // Creates cycle
+	// First two deps succeed
+	dep1 := &types.Dependency{IssueID: issueA.ID, DependsOnID: issueB.ID, Type: types.DepBlocks}
+	if err := store.AddDependency(ctx, dep1, "tester"); err != nil {
+		t.Fatalf("failed to add dependency A->B: %v", err)
 	}
-	for _, d := range deps {
-		if err := store.AddDependency(ctx, d, "tester"); err != nil {
-			t.Fatalf("failed to add dependency: %v", err)
-		}
+	dep2 := &types.Dependency{IssueID: issueB.ID, DependsOnID: issueC.ID, Type: types.DepBlocks}
+	if err := store.AddDependency(ctx, dep2, "tester"); err != nil {
+		t.Fatalf("failed to add dependency B->C: %v", err)
 	}
 
+	// Third dep would create cycle - should be rejected
+	dep3 := &types.Dependency{IssueID: issueC.ID, DependsOnID: issueA.ID, Type: types.DepBlocks}
+	if err := store.AddDependency(ctx, dep3, "tester"); err == nil {
+		t.Fatal("expected AddDependency to fail when creating cycle, but it succeeded")
+	}
+
+	// Since cycle was prevented, DetectCycles should find nothing
 	cycles, err := store.DetectCycles(ctx)
 	if err != nil {
 		t.Fatalf("DetectCycles failed: %v", err)
 	}
 
-	if len(cycles) == 0 {
-		t.Error("expected to find a cycle")
+	if len(cycles) != 0 {
+		t.Errorf("expected no cycles since cycle was prevented, got %d", len(cycles))
 	}
 }
 
@@ -574,6 +579,104 @@ func TestGetNewlyUnblockedByClose_ClosedDependent(t *testing.T) {
 
 	if len(unblocked) != 0 {
 		t.Errorf("expected 0 unblocked (closed issue shouldn't count), got %d", len(unblocked))
+	}
+}
+
+// =============================================================================
+// External Dependency Tests (cross-rig references)
+// =============================================================================
+
+func TestAddDependency_ExternalReference(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Create a local issue
+	issue := &types.Issue{
+		ID:        "ext-dep-issue",
+		Title:     "Issue with External Dependency",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+	}
+	if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
+		t.Fatalf("failed to create issue: %v", err)
+	}
+
+	// Add dependency on external reference (cross-rig tracking)
+	// This should NOT fail with FK violation after the fix
+	externalRef := "external:da:da-7eo"
+	dep := &types.Dependency{
+		IssueID:     issue.ID,
+		DependsOnID: externalRef,
+		Type:        types.DepBlocks,
+	}
+	if err := store.AddDependency(ctx, dep, "tester"); err != nil {
+		t.Fatalf("failed to add external dependency: %v", err)
+	}
+
+	// Verify the dependency was created
+	records, err := store.GetDependencyRecords(ctx, issue.ID)
+	if err != nil {
+		t.Fatalf("GetDependencyRecords failed: %v", err)
+	}
+
+	if len(records) != 1 {
+		t.Fatalf("expected 1 dependency, got %d", len(records))
+	}
+
+	if records[0].DependsOnID != externalRef {
+		t.Errorf("expected DependsOnID %q, got %q", externalRef, records[0].DependsOnID)
+	}
+}
+
+func TestAddDependency_MultipleExternalReferences(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Create a convoy-like issue
+	convoy := &types.Issue{
+		ID:        "convoy-test",
+		Title:     "Test Convoy",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeEpic,
+	}
+	if err := store.CreateIssue(ctx, convoy, "tester"); err != nil {
+		t.Fatalf("failed to create convoy: %v", err)
+	}
+
+	// Add multiple external dependencies (simulating cross-rig tracking)
+	externalRefs := []string{
+		"external:da:da-7eo",
+		"external:da:da-1nw",
+		"external:gt:gt-abc",
+	}
+
+	for _, ref := range externalRefs {
+		dep := &types.Dependency{
+			IssueID:     convoy.ID,
+			DependsOnID: ref,
+			Type:        "tracks", // convoy tracking type
+		}
+		if err := store.AddDependency(ctx, dep, "tester"); err != nil {
+			t.Fatalf("failed to add external dependency %s: %v", ref, err)
+		}
+	}
+
+	// Verify all dependencies were created
+	records, err := store.GetDependencyRecords(ctx, convoy.ID)
+	if err != nil {
+		t.Fatalf("GetDependencyRecords failed: %v", err)
+	}
+
+	if len(records) != len(externalRefs) {
+		t.Errorf("expected %d dependencies, got %d", len(externalRefs), len(records))
 	}
 }
 

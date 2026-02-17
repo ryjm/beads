@@ -136,6 +136,11 @@ bd create "Tests" -p 1 --json                        # Auto-assigned: bd-a3f8e9.
 # Create and link discovered work (one command)
 bd create "Found bug" -t bug -p 1 --deps discovered-from:<parent-id> --json
 
+# Create with external reference (v0.9.2+)
+bd create "Fix login" -t bug -p 1 --external-ref "gh-123" --json  # Short form
+bd create "Fix login" -t bug -p 1 --external-ref "https://github.com/org/repo/issues/123" --json  # Full URL
+bd create "Jira task" -t task -p 1 --external-ref "jira-PROJ-456" --json  # Custom prefix
+
 # Preview creation without side effects (v0.47.0+)
 bd create "Issue title" -t task -p 1 --dry-run --json  # Shows what would be created
 ```
@@ -159,6 +164,10 @@ bd q "Task" | xargs bd show                   # Pipe to other commands
 # Update one or more issues
 bd update <id> [<id>...] --status in_progress --json
 bd update <id> [<id>...] --priority 1 --json
+
+# Update external reference (v0.9.2+)
+bd update <id> --external-ref "gh-456" --json           # Short form
+bd update <id> --external-ref "jira-PROJ-789" --json    # Custom prefix
 
 # Edit issue fields in $EDITOR (HUMANS ONLY - not for agents)
 # NOTE: This command is intentionally NOT exposed via the MCP server
@@ -254,6 +263,9 @@ bd search "authentication bug"                          # Basic search
 bd search "login" --status open --json                  # With status filter
 bd search "database" --label backend --limit 10         # With label and limit
 bd search "bd-5q"                                       # Search by partial ID
+
+# Find beads issue by external reference
+bd list --json | jq -r '.[] | select(.external_ref == "gh-123") | .id'
 
 # Filtered search
 bd search "security" --priority-min 0 --priority-max 2  # Priority range
@@ -416,7 +428,6 @@ bd --actor alice <command>
 
 **See also:**
 - [TROUBLESHOOTING.md - Sandboxed environments](TROUBLESHOOTING.md#sandboxed-environments-codex-claude-code-etc) for detailed sandbox troubleshooting
-- [DAEMON.md](DAEMON.md) for daemon mode details
 
 ## Advanced Operations
 
@@ -534,30 +545,6 @@ bd info --schema --json                                # Get schema, tables, con
 
 These invariants prevent data loss and would have caught issues like GH #201 (missing issue_prefix after migration).
 
-### Daemon Management
-
-See [docs/DAEMON.md](DAEMON.md) for complete daemon management reference.
-
-```bash
-# List all running daemons
-bd daemons list --json
-
-# Check health (version mismatches, stale sockets)
-bd daemons health --json
-
-# Stop/restart specific daemon
-bd daemons stop /path/to/workspace --json
-bd daemons restart 12345 --json  # By PID
-
-# View daemon logs
-bd daemons logs /path/to/workspace -n 100
-bd daemons logs 12345 -f  # Follow mode
-
-# Stop all daemons
-bd daemons killall --json
-bd daemons killall --force --json  # Force kill if graceful fails
-```
-
 ### Sync Operations
 
 ```bash
@@ -605,6 +592,14 @@ bd resolve-conflicts --dry-run --json         # Preview resolution
 Only `blocks` dependencies affect the ready work queue.
 
 **Note:** When creating an issue with a `discovered-from` dependency, the new issue automatically inherits the parent's `source_repo` field.
+
+## External References
+
+The `--external-ref` flag (v0.9.2+) links beads issues to external trackers:
+
+- Supports short form (`gh-123`) or full URL (`https://github.com/...`)
+- Portable via JSONL - survives sync across machines
+- Custom prefixes work for any tracker (`jira-PROJ-456`, `linear-789`)
 
 ## Output Formats
 
@@ -696,7 +691,6 @@ bd sync  # Force immediate sync, bypass debounce
 ## See Also
 
 - [AGENTS.md](../AGENTS.md) - Main agent workflow guide
-- [DAEMON.md](DAEMON.md) - Daemon management and event-driven mode
-- [GIT_INTEGRATION.md](GIT_INTEGRATION.md) - Git workflows and merge strategies
+- [GIT_INTEGRATION.md](GIT_INTEGRATION.md) - Git worktrees and protected branches
 - [LABELS.md](../LABELS.md) - Label system guide
 - [README.md](../README.md) - User documentation

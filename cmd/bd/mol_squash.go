@@ -9,7 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -145,9 +145,6 @@ func runMolSquash(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Schedule auto-flush
-	markDirtyAndScheduleFlush()
-
 	if jsonOutput {
 		outputJSON(result)
 		return
@@ -215,7 +212,7 @@ func generateDigest(root *types.Issue, children []*types.Issue) string {
 // If summary is provided (non-empty), it's used as the digest content.
 // Otherwise, generateDigest() creates a basic concatenation.
 // This enables agents to provide AI-generated summaries while keeping bd as a pure tool.
-func squashMolecule(ctx context.Context, s storage.Storage, root *types.Issue, children []*types.Issue, keepChildren bool, summary string, actorName string) (*SquashResult, error) {
+func squashMolecule(ctx context.Context, s *dolt.DoltStore, root *types.Issue, children []*types.Issue, keepChildren bool, summary string, actorName string) (*SquashResult, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
 	}
@@ -243,7 +240,7 @@ func squashMolecule(ctx context.Context, s storage.Storage, root *types.Issue, c
 		CloseReason: fmt.Sprintf("Squashed from %d wisps", len(children)),
 		Priority:    root.Priority,
 		IssueType:   types.TypeTask,
-		Ephemeral:        false, // Digest is permanent, not a wisp
+		Ephemeral:   false, // Digest is permanent, not a wisp
 		ClosedAt:    &now,
 	}
 
@@ -293,17 +290,11 @@ func squashMolecule(ctx context.Context, s storage.Storage, root *types.Issue, c
 }
 
 // deleteWispChildren removes the wisp issues from the database
-func deleteWispChildren(ctx context.Context, s storage.Storage, ids []string) (int, error) {
-	// Type assert to SQLite storage for delete access
-	d, ok := s.(*sqlite.SQLiteStorage)
-	if !ok {
-		return 0, fmt.Errorf("delete not supported by this storage backend")
-	}
-
+func deleteWispChildren(ctx context.Context, s *dolt.DoltStore, ids []string) (int, error) {
 	deleted := 0
 	var lastErr error
 	for _, id := range ids {
-		if err := d.DeleteIssue(ctx, id); err != nil {
+		if err := s.DeleteIssue(ctx, id); err != nil {
 			lastErr = err
 			continue
 		}

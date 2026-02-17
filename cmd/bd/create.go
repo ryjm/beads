@@ -14,10 +14,7 @@ import (
 	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/routing"
-	"github.com/steveyegge/beads/internal/rpc"
-	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/factory"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/timeparsing"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
@@ -71,16 +68,18 @@ var createCmd = &cobra.Command{
 		silent, _ := cmd.Flags().GetBool("silent")
 
 		// Warn if creating a test issue in production database (unless silent mode)
-		if strings.HasPrefix(strings.ToLower(title), "test") && !silent && !debug.IsQuiet() {
-			fmt.Fprintf(os.Stderr, "%s Creating issue with 'Test' prefix in production database.\n", ui.RenderWarn("⚠"))
-			fmt.Fprintf(os.Stderr, "  For testing, consider using: BEADS_DB=/tmp/test.db ./bd create \"Test issue\"\n")
+		if isTestIssue(title) && !silent && !debug.IsQuiet() {
+			fmt.Fprintf(os.Stderr, "%s Creating test issue in production database\n", ui.RenderWarn("⚠"))
+			fmt.Fprintf(os.Stderr, "  Title: %q appears to be test data\n", title)
+			fmt.Fprintf(os.Stderr, "  Recommendation: Use isolated test database with BEADS_DB\n")
+			fmt.Fprintf(os.Stderr, "    BEADS_DB=/tmp/test.db ./bd create %q\n", title)
 		}
 
 		// Get field values
 		description, _ := getDescriptionFlag(cmd)
 
 		// Check if description is required by config
-		if description == "" && !strings.Contains(strings.ToLower(title), "test") {
+		if description == "" && !isTestIssue(title) {
 			if config.GetBool("create.require-description") {
 				FatalError("description is required (set create.require-description: false in config.yaml to disable)")
 			}
@@ -95,6 +94,7 @@ var createCmd = &cobra.Command{
 		design, _ := cmd.Flags().GetString("design")
 		acceptance, _ := cmd.Flags().GetString("acceptance")
 		notes, _ := cmd.Flags().GetString("notes")
+		specID, _ := cmd.Flags().GetString("spec-id")
 
 		// Parse priority (supports both "1" and "P1" formats)
 		priorityStr, _ := cmd.Flags().GetString("priority")
@@ -129,6 +129,16 @@ var createCmd = &cobra.Command{
 			molType = types.MolType(molTypeStr)
 			if !molType.IsValid() {
 				FatalError("invalid mol-type %q (must be swarm, patrol, or work)", molTypeStr)
+			}
+		}
+
+		// Parse wisp type (TTL classification for ephemeral wisps)
+		wispTypeStr, _ := cmd.Flags().GetString("wisp-type")
+		var wispType types.WispType
+		if wispTypeStr != "" {
+			wispType = types.WispType(wispTypeStr)
+			if !wispType.IsValid() {
+				FatalError("invalid wisp-type %q (must be heartbeat, ping, patrol, gc_report, recovery, error, or escalation)", wispTypeStr)
 			}
 		}
 
@@ -194,6 +204,7 @@ var createCmd = &cobra.Command{
 				Design:             design,
 				AcceptanceCriteria: acceptance,
 				Notes:              notes,
+				SpecID:             specID,
 				Status:             types.StatusOpen,
 				Priority:           priority,
 				IssueType:          types.IssueType(issueType).Normalize(),
@@ -203,6 +214,7 @@ var createCmd = &cobra.Command{
 				CreatedBy:          getActorWithGit(),
 				Owner:              getOwner(),
 				MolType:            molType,
+				WispType:           wispType,
 				Rig:                agentRig,
 				DueAt:              dueAt,
 				DeferUntil:         deferUntil,
@@ -272,7 +284,7 @@ var createCmd = &cobra.Command{
 								// Found a matching route - auto-route to that rig
 								rigName := routing.ExtractProjectFromPath(route.Path)
 								if rigName != "" {
-									createInRig(cmd, rigName, explicitID, title, description, issueType, priority, design, acceptance, notes, assignee, labels, externalRef, wisp)
+									createInRig(cmd, rigName, explicitID, title, description, issueType, priority, design, acceptance, notes, assignee, labels, externalRef, specID, wisp)
 									return
 								}
 							}
@@ -292,7 +304,7 @@ var createCmd = &cobra.Command{
 			targetRig = prefixOverride
 		}
 		if targetRig != "" {
-			createInRig(cmd, targetRig, explicitID, title, description, issueType, priority, design, acceptance, notes, assignee, labels, externalRef, wisp)
+			createInRig(cmd, targetRig, explicitID, title, description, issueType, priority, design, acceptance, notes, assignee, labels, externalRef, specID, wisp)
 			return
 		}
 
@@ -373,8 +385,8 @@ var createCmd = &cobra.Command{
 		}
 
 		// Switch to target repo for multi-repo support (bd-6x6g)
-		// When routing to a different repo, we bypass daemon mode and use direct storage
-		var targetStore storage.Storage
+		// When routing to a different repo, we use direct storage access
+		var targetStore *dolt.DoltStore
 		if repoPath != "." {
 			targetBeadsDir := routing.ExpandPath(repoPath)
 			debug.Logf("DEBUG: Routing to target repo: %s\n", targetBeadsDir)
@@ -387,7 +399,7 @@ var createCmd = &cobra.Command{
 			// Open new store for target repo using factory to respect backend config
 			targetBeadsDirPath := filepath.Join(targetBeadsDir, ".beads")
 			var err error
-			targetStore, err = factory.NewFromConfig(rootCtx, targetBeadsDirPath)
+			targetStore, err = dolt.NewFromConfig(rootCtx, targetBeadsDirPath)
 			if err != nil {
 				FatalError("failed to open target store: %v", err)
 			}
@@ -397,13 +409,11 @@ var createCmd = &cobra.Command{
 			// will close whatever store is assigned to the global `store` variable.
 			// This fixes the "database is closed" error during auto-flush (GH#routing-close-bug).
 			if store != nil {
-				_ = store.Close()
+				_ = store.Close() // Best effort cleanup on error path
 			}
 
 			// Replace store for remainder of create operation
-			// This also bypasses daemon mode since daemon owns the current repo's store
 			store = targetStore
-			daemonClient = nil // Bypass daemon for routed issues (T013)
 		}
 
 		// Check for conflicting flags
@@ -412,9 +422,7 @@ var createCmd = &cobra.Command{
 		}
 
 		// If parent is specified, generate child ID
-		// In daemon mode, the parent will be sent to the RPC handler
-		// In direct mode, we generate the child ID here
-		if parentID != "" && daemonClient == nil {
+		if parentID != "" {
 			ctx := rootCtx
 			// Validate parent exists before generating child ID
 			parentIssue, err := store.GetIssue(ctx, parentID)
@@ -446,26 +454,11 @@ var createCmd = &cobra.Command{
 
 			// Get database prefix and allowed prefixes from config
 			var dbPrefix, allowedPrefixes string
-			if daemonClient != nil {
-				// Daemon mode - use RPC to get config
-				configResp, err := daemonClient.GetConfig(&rpc.GetConfigArgs{Key: "issue_prefix"})
-				if err == nil {
-					dbPrefix = configResp.Value
-				}
-				// Also get allowed_prefixes for multi-prefix support (e.g., Gas Town)
-				allowedResp, err := daemonClient.GetConfig(&rpc.GetConfigArgs{Key: "allowed_prefixes"})
-				if err == nil {
-					allowedPrefixes = allowedResp.Value
-				}
-				// If error, continue without validation (non-fatal)
-			} else {
-				// Direct mode - check config (GH#1145: fallback to config.yaml)
-				dbPrefix, _ = store.GetConfig(ctx, "issue_prefix")
-				if dbPrefix == "" {
-					dbPrefix = config.GetString("issue-prefix")
-				}
-				allowedPrefixes, _ = store.GetConfig(ctx, "allowed_prefixes")
+			dbPrefix, _ = store.GetConfig(ctx, "issue_prefix") // Best effort: empty prefix is a valid fallback
+			if dbPrefix == "" {
+				dbPrefix = config.GetString("issue-prefix")
 			}
+			allowedPrefixes, _ = store.GetConfig(ctx, "allowed_prefixes") // Best effort: empty means no prefix restriction
 
 			// Use ValidateIDPrefixAllowed which handles multi-hyphen prefixes correctly (GH#1135)
 			// This checks if the ID starts with an allowed prefix, rather than extracting
@@ -480,70 +473,6 @@ var createCmd = &cobra.Command{
 			externalRefPtr = &externalRef
 		}
 
-		// If daemon is running, use RPC
-		if daemonClient != nil {
-			createArgs := &rpc.CreateArgs{
-				ID:                 explicitID,
-				Parent:             parentID,
-				Title:              title,
-				Description:        description,
-				IssueType:          issueType,
-				Priority:           priority,
-				Design:             design,
-				AcceptanceCriteria: acceptance,
-				Notes:              notes,
-				Assignee:           assignee,
-				ExternalRef:        externalRef,
-				EstimatedMinutes:   estimatedMinutes,
-				Labels:             labels,
-				Dependencies:       deps,
-				WaitsFor:           waitsFor,
-				WaitsForGate:       waitsForGate,
-				Ephemeral:          wisp,
-				CreatedBy:          getActorWithGit(),
-				Owner:              getOwner(),
-				MolType:            string(molType),
-				Rig:                agentRig,
-				EventCategory:      eventCategory,
-				EventActor:         eventActor,
-				EventTarget:        eventTarget,
-				EventPayload:       eventPayload,
-				DueAt:              formatTimeForRPC(dueAt),
-				DeferUntil:         formatTimeForRPC(deferUntil),
-			}
-
-			resp, err := daemonClient.Create(createArgs)
-			if err != nil {
-				FatalError("%v", err)
-			}
-
-			// Parse response to get issue for hook
-			var issue types.Issue
-			if err := json.Unmarshal(resp.Data, &issue); err != nil {
-				FatalError("parsing response: %v", err)
-			}
-
-			// Run create hook
-			if hookRunner != nil {
-				hookRunner.Run(hooks.EventCreate, &issue)
-			}
-
-			if jsonOutput {
-				fmt.Println(string(resp.Data))
-			} else if silent {
-				fmt.Println(issue.ID)
-			} else {
-				fmt.Printf("%s Created issue: %s\n", ui.RenderPass("✓"), issue.ID)
-				fmt.Printf("  Title: %s\n", issue.Title)
-				fmt.Printf("  Priority: P%d\n", issue.Priority)
-				fmt.Printf("  Status: %s\n", issue.Status)
-			}
-
-			// Track as last touched issue
-			SetLastTouchedID(issue.ID)
-			return
-		}
-
 		// Direct mode
 		issue := &types.Issue{
 			ID:                 explicitID, // Set explicit ID if provided (empty string if not)
@@ -552,6 +481,7 @@ var createCmd = &cobra.Command{
 			Design:             design,
 			AcceptanceCriteria: acceptance,
 			Notes:              notes,
+			SpecID:             specID,
 			Status:             types.StatusOpen,
 			Priority:           priority,
 			IssueType:          types.IssueType(issueType).Normalize(),
@@ -562,6 +492,7 @@ var createCmd = &cobra.Command{
 			CreatedBy:          getActorWithGit(),
 			Owner:              getOwner(),
 			MolType:            molType,
+			WispType:           wispType,
 			Rig:                agentRig,
 			EventKind:          eventCategory,
 			Actor:              eventActor,
@@ -674,6 +605,10 @@ var createCmd = &cobra.Command{
 					continue
 				}
 				depType = types.DependencyType(strings.TrimSpace(parts[0]))
+				// "depends-on" is an alias — keep default direction (new issue depends on target)
+				if depType == "depends-on" {
+					depType = types.DepBlocks
+				}
 				dependsOnID = strings.TrimSpace(parts[1])
 			} else {
 				// Default to "blocks" if no type specified
@@ -692,6 +627,12 @@ var createCmd = &cobra.Command{
 				IssueID:     issue.ID,
 				DependsOnID: dependsOnID,
 				Type:        depType,
+			}
+			// When user explicitly says "blocks:X", they mean "new issue blocks X"
+			// So X depends on the new issue — swap direction
+			if depType == types.DepBlocks && strings.Contains(depSpec, ":") {
+				dep.IssueID = dependsOnID
+				dep.DependsOnID = issue.ID
 			}
 			if err := store.AddDependency(ctx, dep, actor); err != nil {
 				WarnError("failed to add dependency %s -> %s: %v", issue.ID, dependsOnID, err)
@@ -729,9 +670,6 @@ var createCmd = &cobra.Command{
 			}
 		}
 
-		// Schedule auto-flush
-		markDirtyAndScheduleFlush()
-
 		// If issue was routed to a different repo, flush its JSONL immediately
 		// so the issue appears in bd list when hydration is enabled (bd-fix-routing)
 		if repoPath != "." {
@@ -764,15 +702,9 @@ var createCmd = &cobra.Command{
 
 // flushRoutedRepo ensures the target repo's JSONL is updated after routing an issue.
 // This is critical for multi-repo hydration to work correctly (bd-fix-routing).
-// Respects sync mode: skips JSONL export in dolt-native mode (bd-a9ka).
-func flushRoutedRepo(targetStore storage.Storage, repoPath string) {
+// Always writes local JSONL as a safety net (even in dolt-native mode).
+func flushRoutedRepo(targetStore *dolt.DoltStore, repoPath string) {
 	ctx := context.Background()
-
-	// Check sync mode before JSONL export (bd-a9ka: dolt-native mode should skip JSONL)
-	if !ShouldExportJSONL(ctx, targetStore) {
-		debug.Logf("skipping JSONL flush for routed repo (dolt-native mode)")
-		return
-	}
 
 	// Expand the repo path and construct the .beads directory path
 	targetBeadsDir := routing.ExpandPath(repoPath)
@@ -786,58 +718,29 @@ func flushRoutedRepo(targetStore storage.Storage, repoPath string) {
 		targetBeadsDir = absPath
 	}
 
-	// Construct paths for daemon socket and JSONL
+	// Construct JSONL path
 	beadsDir := filepath.Join(targetBeadsDir, ".beads")
-	socketPath := filepath.Join(beadsDir, "bd.sock")
 	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
 
 	debug.Logf("attempting to flush routed repo at %s", targetBeadsDir)
 
-	// Try to connect to target repo's daemon (if running)
-	flushed := false
-	if client, err := rpc.TryConnect(socketPath); err == nil && client != nil {
-		defer func() { _ = client.Close() }()
-
-		// Daemon is running - ask it to export
-		debug.Logf("found running daemon in target repo, requesting export")
-		exportArgs := &rpc.ExportArgs{
-			JSONLPath: jsonlPath,
-		}
-		if resp, err := client.Export(exportArgs); err == nil && resp.Success {
-			debug.Logf("successfully flushed via target repo daemon")
-			flushed = true
-		} else {
-			if err != nil {
-				debug.Logf("daemon export failed: %v", err)
-			} else {
-				debug.Logf("daemon export error: %s", resp.Error)
-			}
-		}
+	// Export directly to JSONL
+	issues, err := targetStore.SearchIssues(ctx, "", types.IssueFilter{})
+	if err != nil {
+		WarnError("failed to query issues for export: %v", err)
+		return
 	}
 
-	// Fallback: No daemon or daemon flush failed - export directly
-	if !flushed {
-		debug.Logf("no daemon in target repo, exporting directly to JSONL")
-
-		// Get all issues including tombstones (mirrors exportToJSONLDeferred logic)
-		issues, err := targetStore.SearchIssues(ctx, "", types.IssueFilter{IncludeTombstones: true})
-		if err != nil {
-			WarnError("failed to query issues for export: %v", err)
-			return
-		}
-
-		// Perform atomic export (temporary file + rename)
-		if err := performAtomicExport(ctx, jsonlPath, issues, targetStore); err != nil {
-			WarnError("failed to export to target repo: %v", err)
-			return
-		}
-
-		debug.Logf("successfully exported to %s", jsonlPath)
+	if err := performAtomicExport(ctx, jsonlPath, issues, targetStore); err != nil {
+		WarnError("failed to export to target repo: %v", err)
+		return
 	}
+
+	debug.Logf("successfully exported to %s", jsonlPath)
 }
 
 // performAtomicExport writes issues to JSONL using atomic temp file + rename
-func performAtomicExport(_ context.Context, jsonlPath string, issues []*types.Issue, _ storage.Storage) error {
+func performAtomicExport(_ context.Context, jsonlPath string, issues []*types.Issue, _ *dolt.DoltStore) error {
 	// Create temp file with PID suffix for atomic write
 	tempPath := fmt.Sprintf("%s.tmp.%d", jsonlPath, os.Getpid())
 
@@ -845,7 +748,7 @@ func performAtomicExport(_ context.Context, jsonlPath string, issues []*types.Is
 	defer func() {
 		// Remove temp file if it still exists (rename failed or error occurred)
 		if _, err := os.Stat(tempPath); err == nil {
-			_ = os.Remove(tempPath)
+			_ = os.Remove(tempPath) // Best effort cleanup of temp file
 		}
 	}()
 
@@ -859,14 +762,14 @@ func performAtomicExport(_ context.Context, jsonlPath string, issues []*types.Is
 	encoder := json.NewEncoder(tempFile)
 	for _, issue := range issues {
 		if err := encoder.Encode(issue); err != nil {
-			_ = tempFile.Close()
+			_ = tempFile.Close() // Best effort cleanup
 			return fmt.Errorf("failed to encode issue %s: %w", issue.ID, err)
 		}
 	}
 
 	// Sync to disk before rename
 	if err := tempFile.Sync(); err != nil {
-		_ = tempFile.Close()
+		_ = tempFile.Close() // Best effort cleanup
 		return fmt.Errorf("failed to sync temp file: %w", err)
 	}
 
@@ -888,8 +791,9 @@ func init() {
 	createCmd.Flags().Bool("silent", false, "Output only the issue ID (for scripting)")
 	createCmd.Flags().Bool("dry-run", false, "Preview what would be created without actually creating")
 	registerPriorityFlag(createCmd, "2")
-	createCmd.Flags().StringP("type", "t", "task", "Issue type (bug|feature|task|epic|chore|merge-request|molecule|gate|agent|role|rig|convoy|event); enhancement is alias for feature")
+	createCmd.Flags().StringP("type", "t", "task", "Issue type (bug|feature|task|epic|chore|decision); custom types require types.custom config; aliases: enhancement/feat→feature, dec/adr→decision")
 	registerCommonIssueFlags(createCmd)
+	createCmd.Flags().String("spec-id", "", "Link to specification document")
 	createCmd.Flags().StringSliceP("labels", "l", []string{}, "Labels (comma-separated)")
 	createCmd.Flags().StringSlice("label", []string{}, "Alias for --labels")
 	_ = createCmd.Flags().MarkHidden("label") // Only fails if flag missing (caught in tests)
@@ -905,6 +809,7 @@ func init() {
 	createCmd.Flags().IntP("estimate", "e", 0, "Time estimate in minutes (e.g., 60 for 1 hour)")
 	createCmd.Flags().Bool("ephemeral", false, "Create as ephemeral (ephemeral, not exported to JSONL)")
 	createCmd.Flags().String("mol-type", "", "Molecule type: swarm (multi-polecat), patrol (recurring ops), work (default)")
+	createCmd.Flags().String("wisp-type", "", "Wisp type for TTL-based compaction: heartbeat, ping, patrol, gc_report, recovery, error, escalation")
 	createCmd.Flags().Bool("validate", false, "Validate description contains required sections for issue type")
 	// Agent-specific flags (only valid when --type=agent)
 	createCmd.Flags().String("agent-rig", "", "Agent's rig name (requires --type=agent)")
@@ -928,8 +833,8 @@ func init() {
 }
 
 // createInRig creates an issue in a different rig using --rig flag or auto-routing.
-// This bypasses the normal daemon/direct flow and directly creates in the target rig.
-func createInRig(cmd *cobra.Command, rigName, explicitID, title, description, issueType string, priority int, design, acceptance, notes, assignee string, labels []string, externalRef string, wisp bool) {
+// This directly creates in the target rig's database.
+func createInRig(cmd *cobra.Command, rigName, explicitID, title, description, issueType string, priority int, design, acceptance, notes, assignee string, labels []string, externalRef, specID string, wisp bool) {
 	ctx := rootCtx
 
 	// Find the town-level beads directory (where routes.jsonl lives)
@@ -945,7 +850,7 @@ func createInRig(cmd *cobra.Command, rigName, explicitID, title, description, is
 	}
 
 	// Open storage for the target rig using factory to respect backend config
-	targetStore, err := factory.NewFromConfig(ctx, targetBeadsDir)
+	targetStore, err := dolt.NewFromConfig(ctx, targetBeadsDir)
 	if err != nil {
 		FatalError("failed to open rig %q database: %v", rigName, err)
 	}
@@ -981,6 +886,13 @@ func createInRig(cmd *cobra.Command, rigName, explicitID, title, description, is
 	}
 	agentRig, _ := cmd.Flags().GetString("agent-rig")
 
+	// Extract wisp type (TTL classification for ephemeral wisps)
+	wispTypeStr, _ := cmd.Flags().GetString("wisp-type")
+	var wispType types.WispType
+	if wispTypeStr != "" {
+		wispType = types.WispType(wispTypeStr)
+	}
+
 	// Extract time-based scheduling flags (bd-xwvo fix)
 	var dueAt *time.Time
 	dueStr, _ := cmd.Flags().GetString("due")
@@ -1010,6 +922,7 @@ func createInRig(cmd *cobra.Command, rigName, explicitID, title, description, is
 		Design:             design,
 		AcceptanceCriteria: acceptance,
 		Notes:              notes,
+		SpecID:             specID,
 		Status:             types.StatusOpen,
 		Priority:           priority,
 		IssueType:          types.IssueType(issueType).Normalize(),
@@ -1024,8 +937,9 @@ func createInRig(cmd *cobra.Command, rigName, explicitID, title, description, is
 		Target:    eventTarget,
 		Payload:   eventPayload,
 		// Molecule/agent fields (bd-xwvo fix)
-		MolType: molType,
-		Rig:     agentRig,
+		MolType:  molType,
+		WispType: wispType,
+		Rig:      agentRig,
 		// Time scheduling fields (bd-xwvo fix)
 		DueAt:      dueAt,
 		DeferUntil: deferUntil,
@@ -1089,8 +1003,8 @@ func findTownBeadsDir() (string, error) {
 	return "", fmt.Errorf("no routes.jsonl found in any parent .beads directory")
 }
 
-// formatTimeForRPC converts a *time.Time to RFC3339 string for daemon RPC calls.
-// Returns empty string if t is nil, allowing the daemon to distinguish "not set" from "set to zero".
+// formatTimeForRPC converts a *time.Time to RFC3339 string for RPC calls.
+// Returns empty string if t is nil, to distinguish "not set" from "set to zero".
 func formatTimeForRPC(t *time.Time) string {
 	if t == nil {
 		return ""
@@ -1101,7 +1015,7 @@ func formatTimeForRPC(t *time.Time) string {
 // ensureBeadsDirForPath ensures a beads directory exists at the target path.
 // If the .beads directory doesn't exist, it creates it and initializes with
 // the same prefix as the source store (T010, T012: prefix inheritance).
-func ensureBeadsDirForPath(ctx context.Context, targetPath string, sourceStore storage.Storage) error {
+func ensureBeadsDirForPath(ctx context.Context, targetPath string, sourceStore *dolt.DoltStore) error {
 	beadsDir := filepath.Join(targetPath, ".beads")
 	dbPath := filepath.Join(beadsDir, "beads.db")
 
@@ -1128,18 +1042,18 @@ func ensureBeadsDirForPath(ctx context.Context, targetPath string, sourceStore s
 		}
 	}
 
-	// Initialize database - it will be created when sqlite.New is called
+	// Initialize database - it will be created when dolt.New is called
 	// But we need to set the prefix if source store has one (T012: prefix inheritance)
 	if sourceStore != nil {
 		sourcePrefix, err := sourceStore.GetConfig(ctx, "issue_prefix")
 		if err == nil && sourcePrefix != "" {
 			// Open target store temporarily to set prefix
-			tempStore, err := sqlite.New(ctx, dbPath)
+			tempStore, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
 			if err != nil {
 				return fmt.Errorf("failed to initialize target database: %w", err)
 			}
 			if err := tempStore.SetConfig(ctx, "issue_prefix", sourcePrefix); err != nil {
-				_ = tempStore.Close()
+				_ = tempStore.Close() // Best effort cleanup on error path
 				return fmt.Errorf("failed to set prefix in target store: %w", err)
 			}
 			if err := tempStore.Close(); err != nil {

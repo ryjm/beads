@@ -36,13 +36,13 @@ func (s *DoltStore) RunInTransaction(ctx context.Context, fn func(tx storage.Tra
 
 	defer func() {
 		if r := recover(); r != nil {
-			_ = sqlTx.Rollback()
+			_ = sqlTx.Rollback() // Best effort rollback on error path
 			panic(r)
 		}
 	}()
 
 	if err := fn(tx); err != nil {
-		_ = sqlTx.Rollback()
+		_ = sqlTx.Rollback() // Best effort rollback on error path
 		return err
 	}
 
@@ -119,9 +119,25 @@ func (t *doltTransaction) SearchIssues(ctx context.Context, query string, filter
 		args = append(args, pattern, pattern, pattern)
 	}
 
+	// Parent filtering: filter children by parent issue
+	// Also includes dotted-ID children (e.g., "parent.1.2" is child of "parent")
+	if filter.ParentID != nil {
+		parentID := *filter.ParentID
+		whereClauses = append(whereClauses, "(id IN (SELECT issue_id FROM dependencies WHERE type = 'parent-child' AND depends_on_id = ?) OR id LIKE CONCAT(?, '.%'))")
+		args = append(args, parentID, parentID)
+	}
+
 	if filter.Status != nil {
 		whereClauses = append(whereClauses, "status = ?")
 		args = append(args, *filter.Status)
+	}
+	if filter.SpecIDPrefix != "" {
+		whereClauses = append(whereClauses, "spec_id LIKE ?")
+		args = append(args, filter.SpecIDPrefix+"%")
+	}
+	if filter.SourceRepo != nil {
+		whereClauses = append(whereClauses, "source_repo = ?")
+		args = append(args, *filter.SourceRepo)
 	}
 
 	whereSQL := ""
@@ -135,14 +151,27 @@ func (t *doltTransaction) SearchIssues(ctx context.Context, query string, filter
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	var issues []*types.Issue
+	// Collect all IDs first, then close rows before fetching full issues.
+	// MySQL server mode can't handle multiple active result sets on one connection.
+	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close() // Best effort cleanup on error path
 			return nil, err
 		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close() // Best effort cleanup on error path
+		return nil, err
+	}
+	_ = rows.Close() // Redundant close for safety (rows already iterated)
+
+	// Now fetch each issue (safe since rows is closed)
+	var issues []*types.Issue
+	for _, id := range ids {
 		issue, err := t.GetIssue(ctx, id)
 		if err != nil {
 			return nil, err
@@ -151,7 +180,7 @@ func (t *doltTransaction) SearchIssues(ctx context.Context, query string, filter
 			issues = append(issues, issue)
 		}
 	}
-	return issues, rows.Err()
+	return issues, nil
 }
 
 // UpdateIssue updates an issue within the transaction
@@ -336,15 +365,6 @@ func (t *doltTransaction) ImportIssueComment(ctx context.Context, issueID, autho
 		return nil, fmt.Errorf("failed to get comment id: %w", err)
 	}
 
-	// mark dirty in tx
-	if _, err := t.tx.ExecContext(ctx, `
-		INSERT INTO dirty_issues (issue_id, marked_at)
-		VALUES (?, ?)
-		ON DUPLICATE KEY UPDATE marked_at = VALUES(marked_at)
-	`, issueID, time.Now().UTC()); err != nil {
-		return nil, fmt.Errorf("failed to mark issue dirty: %w", err)
-	}
-
 	return &types.Comment{ID: id, IssueID: issueID, Author: author, Text: text, CreatedAt: createdAt}, nil
 }
 
@@ -387,18 +407,18 @@ func insertIssueTx(ctx context.Context, tx *sql.Tx, issue *types.Issue) error {
 			id, content_hash, title, description, design, acceptance_criteria, notes,
 			status, priority, issue_type, assignee, estimated_minutes,
 			created_at, created_by, owner, updated_at, closed_at,
-			sender, ephemeral, pinned, is_template, crystallizes
+			sender, ephemeral, wisp_type, pinned, is_template, crystallizes
 		) VALUES (
 			?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?
+			?, ?, ?, ?, ?, ?
 		)
 	`,
 		issue.ID, issue.ContentHash, issue.Title, issue.Description, issue.Design, issue.AcceptanceCriteria, issue.Notes,
 		issue.Status, issue.Priority, issue.IssueType, nullString(issue.Assignee), nullInt(issue.EstimatedMinutes),
 		issue.CreatedAt, issue.CreatedBy, issue.Owner, issue.UpdatedAt, issue.ClosedAt,
-		issue.Sender, issue.Ephemeral, issue.Pinned, issue.IsTemplate, issue.Crystallizes,
+		issue.Sender, issue.Ephemeral, string(issue.WispType), issue.Pinned, issue.IsTemplate, issue.Crystallizes,
 	)
 	return err
 }

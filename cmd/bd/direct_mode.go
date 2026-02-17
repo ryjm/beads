@@ -8,50 +8,13 @@ import (
 
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/debug"
-	"github.com/steveyegge/beads/internal/storage/factory"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/syncbranch"
 )
 
 // ensureDirectMode makes sure the CLI is operating in direct-storage mode.
-// If the daemon is active, it is cleanly disconnected and the shared store is opened.
-func ensureDirectMode(reason string) error {
-	if getDaemonClient() != nil {
-		if err := fallbackToDirectMode(reason); err != nil {
-			return err
-		}
-		return nil
-	}
+func ensureDirectMode(_ string) error {
 	return ensureStoreActive()
-}
-
-// fallbackToDirectMode disables the daemon client and ensures a local store is ready.
-func fallbackToDirectMode(reason string) error {
-	disableDaemonForFallback(reason)
-	return ensureStoreActive()
-}
-
-// disableDaemonForFallback closes the daemon client and updates status metadata.
-func disableDaemonForFallback(reason string) {
-	if client := getDaemonClient(); client != nil {
-		_ = client.Close()
-		setDaemonClient(nil)
-	}
-
-	ds := getDaemonStatus()
-	ds.Mode = "direct"
-	ds.Connected = false
-	ds.Degraded = true
-	if reason != "" {
-		ds.Detail = reason
-	}
-	if ds.FallbackReason == FallbackNone {
-		ds.FallbackReason = FallbackDaemonUnsupported
-	}
-	setDaemonStatus(ds)
-
-	if reason != "" {
-		debug.Logf("Debug: %s\n", reason)
-	}
 }
 
 // ensureStoreActive guarantees that a storage backend is initialized and tracked.
@@ -91,9 +54,9 @@ func ensureStoreActive() error {
 		}
 	}
 
-	// Use factory to create the appropriate backend (SQLite, Dolt embedded, or Dolt server)
+	// Use dolt.NewFromConfig to create the appropriate backend
 	// based on metadata.json configuration
-	store, err := factory.NewFromConfig(getRootContext(), beadsDir)
+	store, err := dolt.NewFromConfig(getRootContext(), beadsDir)
 	if err != nil {
 		// Check for fresh clone scenario (JSONL exists but no database)
 		if _, statErr := os.Stat(jsonlPath); statErr == nil {
@@ -113,10 +76,6 @@ func ensureStoreActive() error {
 	setStore(store)
 	setStoreActive(true)
 	unlockStore()
-
-	if isAutoImportEnabled() {
-		autoImportIfNewer()
-	}
 
 	return nil
 }

@@ -18,15 +18,13 @@ func TestFixFunctions_RequireBeadsDir(t *testing.T) {
 		fn   func(string) error
 	}{
 		{"GitHooks", GitHooks},
-		{"MergeDriver", MergeDriver},
-		{"Daemon", Daemon},
+		// MergeDriver removed from validation: it's now a no-op (merge engine removed)
 		{"DBJSONLSync", DBJSONLSync},
 		{"DatabaseVersion", DatabaseVersion},
 		{"SchemaCompatibility", SchemaCompatibility},
-		{"SyncBranchConfig", SyncBranchConfig},
+		{"syncBranchConfig", syncBranchConfig},
 		{"SyncBranchHealth", func(dir string) error { return SyncBranchHealth(dir, "beads-sync") }},
 		{"UntrackedJSONL", UntrackedJSONL},
-		{"MigrateTombstones", MigrateTombstones},
 		{"ChildParentDependencies", func(dir string) error { return ChildParentDependencies(dir, false) }},
 		{"OrphanedDependencies", func(dir string) error { return OrphanedDependencies(dir, false) }},
 	}

@@ -1,14 +1,11 @@
-//go:build cgo
-
 package dolt
 
 // currentSchemaVersion is bumped whenever the schema or migrations change.
 // initSchemaOnDB checks this against the stored version and skips re-initialization
 // when they match, avoiding ~20 DDL statements per bd invocation.
-const currentSchemaVersion = 3
+const currentSchemaVersion = 5
 
 // schema defines the MySQL-compatible database schema for Dolt.
-// This mirrors the SQLite schema but uses MySQL syntax.
 const schema = `
 -- Issues table
 CREATE TABLE IF NOT EXISTS issues (
@@ -92,7 +89,6 @@ CREATE TABLE IF NOT EXISTS issues (
 
 -- Dependencies table (edge schema)
 -- Note: No FK on depends_on_id to allow external references (external:<rig>:<id>).
--- See SQLite migration 025_remove_depends_on_fk.go for design context.
 CREATE TABLE IF NOT EXISTS dependencies (
     issue_id VARCHAR(255) NOT NULL,
     depends_on_id VARCHAR(255) NOT NULL,
@@ -206,6 +202,12 @@ CREATE TABLE IF NOT EXISTS routes (
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
 
+-- Issue counter table (for issue_id_mode=counter sequential IDs, GH#2002)
+CREATE TABLE IF NOT EXISTS issue_counter (
+    prefix VARCHAR(255) PRIMARY KEY,
+    last_id INT NOT NULL DEFAULT 0
+);
+
 -- Interactions table (agent audit log)
 CREATE TABLE IF NOT EXISTS interactions (
     id VARCHAR(32) PRIMARY KEY,
@@ -261,7 +263,7 @@ INSERT IGNORE INTO config (` + "`key`" + `, value) VALUES
 `
 
 // readyIssuesView is a MySQL-compatible view for ready work
-// Note: Dolt supports recursive CTEs like SQLite.
+// Note: Dolt supports recursive CTEs.
 // Uses LEFT JOIN instead of NOT EXISTS to avoid Dolt mergeJoinIter panic.
 // See: https://github.com/dolthub/go-mysql-server/issues/3413
 const readyIssuesView = `

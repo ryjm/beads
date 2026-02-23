@@ -154,6 +154,12 @@ func installGitHooks() error {
 	postMergePath := filepath.Join(hooksDir, "post-merge")
 	postMergeContent := buildPostMergeHook(chainHooks, existingHooks)
 
+	// Normalize line endings to LF — on Windows/NTFS, Go string literals
+	// are fine but concatenated content from other sources may have CRLF.
+	// Git hooks with CRLF fail: /usr/bin/env: 'sh\r': No such file or directory
+	preCommitContent = strings.ReplaceAll(preCommitContent, "\r\n", "\n")
+	postMergeContent = strings.ReplaceAll(postMergeContent, "\r\n", "\n")
+
 	// Write pre-commit hook (executable scripts need 0700)
 	// #nosec G306 - git hooks must be executable
 	if err := os.WriteFile(preCommitPath, []byte(preCommitContent), 0700); err != nil {
@@ -207,14 +213,15 @@ fi
 #
 # bd (beads) pre-commit hook
 #
-# This hook ensures that any pending bd issue changes are flushed to
-# .beads/issues.jsonl before the commit is created, preventing the
-# stale JSONL from being committed.
+# This hook ensures that any pending bd issue changes are synced
+# before the commit is created.
 
 ` + preCommitHookBody()
 }
 
-// preCommitHookBody returns the common pre-commit hook logic
+// preCommitHookBody returns the common pre-commit hook logic.
+// Delegates to 'bd hooks run pre-commit' which handles Dolt export
+// and sync-branch routing without lock deadlocks.
 func preCommitHookBody() string {
 	return `# Check if bd is available
 if ! command -v bd >/dev/null 2>&1; then
@@ -222,62 +229,15 @@ if ! command -v bd >/dev/null 2>&1; then
     exit 0
 fi
 
-# Check if we're in a bd workspace
-# For worktrees, .beads is in the main repository root, not the worktree
-BEADS_DIR=""
-if git rev-parse --git-dir >/dev/null 2>&1; then
-    # Check if we're in a worktree
-    if [ "$(git rev-parse --git-dir)" != "$(git rev-parse --git-common-dir)" ]; then
-        # Worktree: .beads is in main repo root
-        MAIN_REPO_ROOT="$(git rev-parse --git-common-dir)"
-        MAIN_REPO_ROOT="$(dirname "$MAIN_REPO_ROOT")"
-        if [ -d "$MAIN_REPO_ROOT/.beads" ]; then
-            BEADS_DIR="$MAIN_REPO_ROOT/.beads"
-        fi
-    else
-        # Regular repo: check current directory
-        if [ -d .beads ]; then
-            BEADS_DIR=".beads"
-        fi
-    fi
-fi
-
-if [ -z "$BEADS_DIR" ]; then
-    exit 0
-fi
-
-# Skip for Dolt backend (uses its own sync mechanism, not JSONL)
-if [ -f "$BEADS_DIR/metadata.json" ]; then
-    if grep -q '"backend"[[:space:]]*:[[:space:]]*"dolt"' "$BEADS_DIR/metadata.json" 2>/dev/null; then
-        exit 0
-    fi
-fi
-
-# Flush pending changes to JSONL
-if ! bd sync --flush-only >/dev/null 2>&1; then
-    echo "Error: Failed to flush bd changes to storage" >&2
-    echo "Run 'bd sync --flush-only' manually to diagnose" >&2
-    exit 1
-fi
-
-# If the JSONL file was modified, stage it
-# For worktrees, the JSONL is in the main repo's working tree, not the worktree,
-# so we can't use git add. Skip this step for worktrees.
-if [ -f "$BEADS_DIR/issues.jsonl" ]; then
-    if [ "$(git rev-parse --git-dir)" = "$(git rev-parse --git-common-dir)" ]; then
-        # Regular repo: file is in the working tree, safe to add
-        git add "$BEADS_DIR/issues.jsonl" 2>/dev/null || true
-    fi
-    # For worktrees: .beads is in the main repo's working tree, not this worktree
-    # Git rejects adding files outside the worktree, so we skip it.
-    # The main repo will see the changes on the next pull/sync.
-fi
-
-exit 0
+# Delegate to bd hooks run pre-commit.
+# The Go code handles Dolt export in-process (no lock deadlocks)
+# and sync-branch routing.
+exec bd hooks run pre-commit "$@"
 `
 }
 
-// buildPostMergeHook generates the post-merge hook content
+// buildPostMergeHook generates the post-merge hook content.
+// With the Dolt backend, post-merge only needs to run chained hooks.
 func buildPostMergeHook(chainHooks bool, existingHooks []hookInfo) string {
 	if chainHooks {
 		// Find existing post-merge hook (already renamed to .old by caller)
@@ -294,6 +254,7 @@ func buildPostMergeHook(chainHooks bool, existingHooks []hookInfo) string {
 # bd (beads) post-merge hook (chained)
 #
 # This hook chains bd functionality with your existing post-merge hook.
+# Dolt backend handles sync internally.
 
 # Run existing hook first
 if [ -x "` + existingPostMerge + `" ]; then
@@ -304,68 +265,16 @@ if [ -x "` + existingPostMerge + `" ]; then
     fi
 fi
 
-` + postMergeHookBody()
+exit 0
+`
 	}
 
 	return `#!/bin/sh
 #
 # bd (beads) post-merge hook
 #
-# This hook imports updated issues from .beads/issues.jsonl after a
-# git pull or merge, ensuring the database stays in sync with git.
-
-` + postMergeHookBody()
-}
-
-// postMergeHookBody returns the common post-merge hook logic
-func postMergeHookBody() string {
-	return `# Check if bd is available
-if ! command -v bd >/dev/null 2>&1; then
-    echo "Warning: bd command not found, skipping post-merge import" >&2
-    exit 0
-fi
-
-# Check if we're in a bd workspace
-# For worktrees, .beads is in the main repository root, not the worktree
-BEADS_DIR=""
-if git rev-parse --git-dir >/dev/null 2>&1; then
-    # Check if we're in a worktree
-    if [ "$(git rev-parse --git-dir)" != "$(git rev-parse --git-common-dir)" ]; then
-        # Worktree: .beads is in main repo root
-        MAIN_REPO_ROOT="$(git rev-parse --git-common-dir)"
-        MAIN_REPO_ROOT="$(dirname "$MAIN_REPO_ROOT")"
-        if [ -d "$MAIN_REPO_ROOT/.beads" ]; then
-            BEADS_DIR="$MAIN_REPO_ROOT/.beads"
-        fi
-    else
-        # Regular repo: check current directory
-        if [ -d .beads ]; then
-            BEADS_DIR=".beads"
-        fi
-    fi
-fi
-
-if [ -z "$BEADS_DIR" ]; then
-    exit 0
-fi
-
-# Skip for Dolt backend (uses its own sync mechanism, not JSONL import)
-if [ -f "$BEADS_DIR/metadata.json" ]; then
-    if grep -q '"backend"[[:space:]]*:[[:space:]]*"dolt"' "$BEADS_DIR/metadata.json" 2>/dev/null; then
-        exit 0
-    fi
-fi
-
-# Check if issues.jsonl exists and was updated
-if [ ! -f "$BEADS_DIR/issues.jsonl" ]; then
-    exit 0
-fi
-
-# Import the updated JSONL
-if ! bd import -i "$BEADS_DIR/issues.jsonl" >/dev/null 2>&1; then
-    echo "Warning: Failed to import bd changes after merge" >&2
-    echo "Run 'bd import -i $BEADS_DIR/issues.jsonl' manually to see the error" >&2
-fi
+# Dolt backend handles sync internally, so this hook is a no-op.
+# It exists to support chaining with user hooks.
 
 exit 0
 `
@@ -477,8 +386,8 @@ fi
 #
 # bd (beads) pre-commit hook (jujutsu mode)
 #
-# This hook ensures that any pending bd issue changes are flushed to
-# .beads/issues.jsonl before the commit.
+# This hook ensures that any pending bd issue changes are flushed
+# before the commit.
 #
 # Simplified for jujutsu: no staging needed, jj auto-commits working copy changes.
 
@@ -519,15 +428,7 @@ if [ -z "$BEADS_DIR" ]; then
     exit 0
 fi
 
-# Flush pending changes to JSONL
-# In jujutsu, changes automatically become part of the working copy commit
-if ! bd sync --flush-only >/dev/null 2>&1; then
-    echo "Error: Failed to flush bd changes to storage" >&2
-    echo "Run 'bd sync --flush-only' manually to diagnose" >&2
-    exit 1
-fi
-
-# No git add needed - jujutsu automatically includes working copy changes
+# Dolt handles persistence directly — no flush needed.
 exit 0
 `
 }

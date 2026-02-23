@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 // envSnapshot saves and clears BD_/BEADS_ environment variables.
@@ -67,7 +66,6 @@ func TestDefaults(t *testing.T) {
 		{"json", false, func(k string) interface{} { return GetBool(k) }},
 		{"db", "", func(k string) interface{} { return GetString(k) }},
 		{"actor", "", func(k string) interface{} { return GetString(k) }},
-		{"flush-debounce", 30 * time.Second, func(k string) interface{} { return GetDuration(k) }},
 	}
 
 	for _, tt := range tests {
@@ -92,7 +90,6 @@ func TestEnvironmentBinding(t *testing.T) {
 		{"BD_JSON", "json", "true", true, func(k string) interface{} { return GetBool(k) }},
 		{"BD_ACTOR", "actor", "testuser", "testuser", func(k string) interface{} { return GetString(k) }},
 		{"BD_DB", "db", "/tmp/test.db", "/tmp/test.db", func(k string) interface{} { return GetString(k) }},
-		{"BEADS_FLUSH_DEBOUNCE", "flush-debounce", "10s", 10 * time.Second, func(k string) interface{} { return GetDuration(k) }},
 	}
 
 	for _, tt := range tests {
@@ -129,7 +126,6 @@ func TestConfigFile(t *testing.T) {
 json: true
 no-daemon: true
 actor: configuser
-flush-debounce: 15s
 `
 	configPath := filepath.Join(tmpDir, "config.yaml")
 	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
@@ -170,10 +166,6 @@ flush-debounce: 15s
 	if got := GetString("actor"); got != "configuser" {
 		t.Errorf("GetString(actor) = %q, want \"configuser\"", got)
 	}
-
-	if got := GetDuration("flush-debounce"); got != 15*time.Second {
-		t.Errorf("GetDuration(flush-debounce) = %v, want 15s", got)
-	}
 }
 
 func TestLocalConfigOverride(t *testing.T) {
@@ -195,7 +187,6 @@ func TestLocalConfigOverride(t *testing.T) {
 json: false
 no-daemon: false
 actor: project-user
-flush-debounce: 15s
 `
 	configPath := filepath.Join(beadsDir, "config.yaml")
 	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
@@ -232,10 +223,6 @@ actor: local-user
 	// Test that non-overridden values from project config are preserved
 	if got := GetBool("json"); got != false {
 		t.Errorf("GetBool(json) = %v, want false (from project config)", got)
-	}
-
-	if got := GetDuration("flush-debounce"); got != 15*time.Second {
-		t.Errorf("GetDuration(flush-debounce) = %v, want 15s (from project config)", got)
 	}
 }
 
@@ -1130,18 +1117,8 @@ validation:
 // Tests for sync mode configuration (hq-ew1mbr.3)
 
 func TestSyncModeConstants(t *testing.T) {
-	// Verify sync mode constants have expected string values
-	if SyncModeGitPortable != "git-portable" {
-		t.Errorf("SyncModeGitPortable = %q, want \"git-portable\"", SyncModeGitPortable)
-	}
-	if SyncModeRealtime != "realtime" {
-		t.Errorf("SyncModeRealtime = %q, want \"realtime\"", SyncModeRealtime)
-	}
 	if SyncModeDoltNative != "dolt-native" {
 		t.Errorf("SyncModeDoltNative = %q, want \"dolt-native\"", SyncModeDoltNative)
-	}
-	if SyncModeBeltAndSuspenders != "belt-and-suspenders" {
-		t.Errorf("SyncModeBeltAndSuspenders = %q, want \"belt-and-suspenders\"", SyncModeBeltAndSuspenders)
 	}
 }
 
@@ -1198,14 +1175,14 @@ func TestSyncConfigDefaults(t *testing.T) {
 	}
 
 	// Test sync mode default
-	if got := GetSyncMode(); got != SyncModeGitPortable {
-		t.Errorf("GetSyncMode() = %q, want %q", got, SyncModeGitPortable)
+	if got := GetSyncMode(); got != SyncModeDoltNative {
+		t.Errorf("GetSyncMode() = %q, want %q", got, SyncModeDoltNative)
 	}
 
 	// Test sync config defaults
 	cfg := GetSyncConfig()
-	if cfg.Mode != SyncModeGitPortable {
-		t.Errorf("GetSyncConfig().Mode = %q, want %q", cfg.Mode, SyncModeGitPortable)
+	if cfg.Mode != SyncModeDoltNative {
+		t.Errorf("GetSyncConfig().Mode = %q, want %q", cfg.Mode, SyncModeDoltNative)
 	}
 	if cfg.ExportOn != SyncTriggerPush {
 		t.Errorf("GetSyncConfig().ExportOn = %q, want %q", cfg.ExportOn, SyncTriggerPush)
@@ -1258,73 +1235,6 @@ func TestFederationConfigDefaults(t *testing.T) {
 	}
 }
 
-func TestIsSyncModeValid(t *testing.T) {
-	tests := []struct {
-		mode  string
-		valid bool
-	}{
-		{string(SyncModeGitPortable), true},
-		{string(SyncModeRealtime), true},
-		{string(SyncModeDoltNative), true},
-		{string(SyncModeBeltAndSuspenders), true},
-		{"invalid-mode", false},
-		{"", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.mode, func(t *testing.T) {
-			if got := IsSyncModeValid(tt.mode); got != tt.valid {
-				t.Errorf("IsSyncModeValid(%q) = %v, want %v", tt.mode, got, tt.valid)
-			}
-		})
-	}
-}
-
-func TestIsConflictStrategyValid(t *testing.T) {
-	tests := []struct {
-		strategy string
-		valid    bool
-	}{
-		{string(ConflictStrategyNewest), true},
-		{string(ConflictStrategyOurs), true},
-		{string(ConflictStrategyTheirs), true},
-		{string(ConflictStrategyManual), true},
-		{"invalid-strategy", false},
-		{"", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.strategy, func(t *testing.T) {
-			if got := IsConflictStrategyValid(tt.strategy); got != tt.valid {
-				t.Errorf("IsConflictStrategyValid(%q) = %v, want %v", tt.strategy, got, tt.valid)
-			}
-		})
-	}
-}
-
-func TestIsSovereigntyValid(t *testing.T) {
-	tests := []struct {
-		sovereignty string
-		valid       bool
-	}{
-		{string(SovereigntyT1), true},
-		{string(SovereigntyT2), true},
-		{string(SovereigntyT3), true},
-		{string(SovereigntyT4), true},
-		{"", true}, // Empty is valid (means no restriction)
-		{"T5", false},
-		{"invalid", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.sovereignty, func(t *testing.T) {
-			if got := IsSovereigntyValid(tt.sovereignty); got != tt.valid {
-				t.Errorf("IsSovereigntyValid(%q) = %v, want %v", tt.sovereignty, got, tt.valid)
-			}
-		})
-	}
-}
-
 func TestSyncConfigFromFile(t *testing.T) {
 	// Create a temporary directory for config file
 	tmpDir := t.TempDir()
@@ -1332,7 +1242,7 @@ func TestSyncConfigFromFile(t *testing.T) {
 	// Create a config file with sync settings
 	configContent := `
 sync:
-  mode: realtime
+  mode: dolt-native
   export_on: change
   import_on: change
 
@@ -1363,8 +1273,8 @@ federation:
 
 	// Test sync config
 	syncCfg := GetSyncConfig()
-	if syncCfg.Mode != SyncModeRealtime {
-		t.Errorf("GetSyncConfig().Mode = %q, want %q", syncCfg.Mode, SyncModeRealtime)
+	if syncCfg.Mode != SyncModeDoltNative {
+		t.Errorf("GetSyncConfig().Mode = %q, want %q", syncCfg.Mode, SyncModeDoltNative)
 	}
 	if syncCfg.ExportOn != SyncTriggerChange {
 		t.Errorf("GetSyncConfig().ExportOn = %q, want %q", syncCfg.ExportOn, SyncTriggerChange)
@@ -1389,137 +1299,6 @@ federation:
 	}
 }
 
-func TestShouldExportOnChange(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	// Initialize config
-	if err := Initialize(); err != nil {
-		t.Fatalf("Initialize() returned error: %v", err)
-	}
-
-	// Default should be false (export on push, not change)
-	if ShouldExportOnChange() {
-		t.Error("ShouldExportOnChange() = true, want false (default)")
-	}
-
-	// Set to change
-	Set("sync.export_on", SyncTriggerChange)
-	if !ShouldExportOnChange() {
-		t.Error("ShouldExportOnChange() = false after setting to change, want true")
-	}
-}
-
-func TestShouldImportOnChange(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	// Initialize config
-	if err := Initialize(); err != nil {
-		t.Fatalf("Initialize() returned error: %v", err)
-	}
-
-	// Default should be false (import on pull, not change)
-	if ShouldImportOnChange() {
-		t.Error("ShouldImportOnChange() = true, want false (default)")
-	}
-
-	// Set to change
-	Set("sync.import_on", SyncTriggerChange)
-	if !ShouldImportOnChange() {
-		t.Error("ShouldImportOnChange() = false after setting to change, want true")
-	}
-}
-
-func TestNeedsDoltRemote(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	tests := []struct {
-		mode        SyncMode
-		needsRemote bool
-	}{
-		{SyncModeGitPortable, false},
-		{SyncModeRealtime, false},
-		{SyncModeDoltNative, true},
-		{SyncModeBeltAndSuspenders, true},
-	}
-
-	for _, tt := range tests {
-		t.Run(string(tt.mode), func(t *testing.T) {
-			if err := Initialize(); err != nil {
-				t.Fatalf("Initialize() returned error: %v", err)
-			}
-			Set("sync.mode", string(tt.mode))
-
-			if got := NeedsDoltRemote(); got != tt.needsRemote {
-				t.Errorf("NeedsDoltRemote() with mode=%s = %v, want %v", tt.mode, got, tt.needsRemote)
-			}
-		})
-	}
-}
-
-func TestNeedsJSONL(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	tests := []struct {
-		mode       SyncMode
-		needsJSONL bool
-	}{
-		{SyncModeGitPortable, true},
-		{SyncModeRealtime, true},
-		{SyncModeDoltNative, false},
-		{SyncModeBeltAndSuspenders, true},
-	}
-
-	for _, tt := range tests {
-		t.Run(string(tt.mode), func(t *testing.T) {
-			if err := Initialize(); err != nil {
-				t.Fatalf("Initialize() returned error: %v", err)
-			}
-			Set("sync.mode", string(tt.mode))
-
-			if got := NeedsJSONL(); got != tt.needsJSONL {
-				t.Errorf("NeedsJSONL() with mode=%s = %v, want %v", tt.mode, got, tt.needsJSONL)
-			}
-		})
-	}
-}
-
-func TestNeedsJSONLImport(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	tests := []struct {
-		mode        SyncMode
-		needsImport bool
-	}{
-		{SyncModeGitPortable, true},
-		{SyncModeRealtime, true},
-		{SyncModeDoltNative, false},
-		{SyncModeBeltAndSuspenders, true},
-	}
-
-	for _, tt := range tests {
-		t.Run(string(tt.mode), func(t *testing.T) {
-			if err := Initialize(); err != nil {
-				t.Fatalf("Initialize() returned error: %v", err)
-			}
-			Set("sync.mode", string(tt.mode))
-
-			if got := NeedsJSONLImport(); got != tt.needsImport {
-				t.Errorf("NeedsJSONLImport() with mode=%s = %v, want %v", tt.mode, got, tt.needsImport)
-			}
-		})
-	}
-}
-
 func TestGetSyncModeInvalid(t *testing.T) {
 	// Isolate from environment variables
 	restore := envSnapshot(t)
@@ -1530,10 +1309,10 @@ func TestGetSyncModeInvalid(t *testing.T) {
 		t.Fatalf("Initialize() returned error: %v", err)
 	}
 
-	// Set invalid mode - should fall back to git-portable
+	// Set invalid mode - always returns dolt-native now
 	Set("sync.mode", "invalid-mode")
-	if got := GetSyncMode(); got != SyncModeGitPortable {
-		t.Errorf("GetSyncMode() with invalid mode = %q, want %q (fallback)", got, SyncModeGitPortable)
+	if got := GetSyncMode(); got != SyncModeDoltNative {
+		t.Errorf("GetSyncMode() with invalid mode = %q, want %q", got, SyncModeDoltNative)
 	}
 }
 
@@ -1898,7 +1677,7 @@ func TestGetAgentRoles_NotSet(t *testing.T) {
 	// Write a config file without agent_roles
 	configContent := `
 sync:
-  mode: git-portable
+  mode: dolt-native
 `
 	configPath := filepath.Join(beadsDir, "config.yaml")
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {

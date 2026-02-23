@@ -1,5 +1,3 @@
-//go:build cgo
-
 package main
 
 import (
@@ -8,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -39,17 +38,16 @@ func TestDoltShowConfigNotInRepo(t *testing.T) {
 	}
 }
 
-func TestDoltShowConfigEmbeddedMode(t *testing.T) {
+func TestDoltShowConfigDefaultMode(t *testing.T) {
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {
 		t.Fatalf("failed to create .beads dir: %v", err)
 	}
 
-	// Create metadata.json with Dolt backend in embedded mode
+	// Create metadata.json with Dolt backend
 	cfg := configfile.DefaultConfig()
 	cfg.Backend = configfile.BackendDolt
-	cfg.DoltMode = configfile.DoltModeEmbedded
 	cfg.DoltDatabase = "testdb"
 	if err := cfg.Save(beadsDir); err != nil {
 		t.Fatalf("failed to save config: %v", err)
@@ -76,11 +74,11 @@ func TestDoltShowConfigEmbeddedMode(t *testing.T) {
 			t.Skip("output capture failed")
 		}
 
-		if !containsAny(output, "embedded", "Mode") {
-			t.Errorf("output should show embedded mode: %s", output)
-		}
 		if !containsAny(output, "testdb", "Database") {
 			t.Errorf("output should show database name: %s", output)
+		}
+		if !containsAny(output, "Host", "Port", "User") {
+			t.Errorf("output should show server connection info: %s", output)
 		}
 	})
 
@@ -103,11 +101,12 @@ func TestDoltShowConfigEmbeddedMode(t *testing.T) {
 		if result["backend"] != "dolt" {
 			t.Errorf("expected backend 'dolt', got %v", result["backend"])
 		}
-		if result["mode"] != "embedded" {
-			t.Errorf("expected mode 'embedded', got %v", result["mode"])
-		}
 		if result["database"] != "testdb" {
 			t.Errorf("expected database 'testdb', got %v", result["database"])
+		}
+		// mode field should no longer be present
+		if _, ok := result["mode"]; ok {
+			t.Error("mode field should no longer be in JSON output")
 		}
 	})
 }
@@ -134,6 +133,8 @@ func TestDoltShowConfigServerMode(t *testing.T) {
 	// Override BEADS_DIR so FindBeadsDir() returns our temp .beads,
 	// not the rig's .beads (which happens in worktree environments).
 	t.Setenv("BEADS_DIR", beadsDir)
+	// Clear test server port override so GetDoltServerPort() returns metadata.json value
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
 
 	oldCwd, _ := os.Getwd()
 	if err := os.Chdir(tmpDir); err != nil {
@@ -152,9 +153,6 @@ func TestDoltShowConfigServerMode(t *testing.T) {
 			t.Skip("output capture failed")
 		}
 
-		if !containsAny(output, "server", "Mode") {
-			t.Errorf("output should show server mode: %s", output)
-		}
 		if !containsAny(output, "192.168.1.100", "Host") {
 			t.Errorf("output should show host: %s", output)
 		}
@@ -182,9 +180,6 @@ func TestDoltShowConfigServerMode(t *testing.T) {
 			t.Skipf("output not pure JSON: %s", output)
 		}
 
-		if result["mode"] != "server" {
-			t.Errorf("expected mode 'server', got %v", result["mode"])
-		}
 		if result["host"] != "192.168.1.100" {
 			t.Errorf("expected host '192.168.1.100', got %v", result["host"])
 		}
@@ -208,7 +203,6 @@ func TestDoltSetConfigValidation(t *testing.T) {
 	// Create metadata.json with Dolt backend
 	cfg := configfile.DefaultConfig()
 	cfg.Backend = configfile.BackendDolt
-	cfg.DoltMode = configfile.DoltModeEmbedded
 	if err := cfg.Save(beadsDir); err != nil {
 		t.Fatalf("failed to save config: %v", err)
 	}
@@ -224,35 +218,6 @@ func TestDoltSetConfigValidation(t *testing.T) {
 		t.Fatalf("failed to chdir: %v", err)
 	}
 	defer func() { _ = os.Chdir(oldCwd) }()
-
-	t.Run("set mode to server", func(t *testing.T) {
-		origJsonOutput := jsonOutput
-		defer func() { jsonOutput = origJsonOutput }()
-		jsonOutput = false
-
-		setDoltConfig("mode", "server", false)
-
-		// Verify the change persisted
-		loadedCfg, err := configfile.Load(beadsDir)
-		if err != nil {
-			t.Fatalf("failed to load config: %v", err)
-		}
-		if loadedCfg.DoltMode != configfile.DoltModeServer {
-			t.Errorf("expected mode 'server', got %s", loadedCfg.DoltMode)
-		}
-	})
-
-	t.Run("set mode to embedded", func(t *testing.T) {
-		setDoltConfig("mode", "embedded", false)
-
-		loadedCfg, err := configfile.Load(beadsDir)
-		if err != nil {
-			t.Fatalf("failed to load config: %v", err)
-		}
-		if loadedCfg.DoltMode != configfile.DoltModeEmbedded {
-			t.Errorf("expected mode 'embedded', got %s", loadedCfg.DoltMode)
-		}
-	})
 
 	t.Run("set database", func(t *testing.T) {
 		setDoltConfig("database", "mydb", false)
@@ -312,7 +277,6 @@ func TestDoltSetConfigJSONOutput(t *testing.T) {
 
 	cfg := configfile.DefaultConfig()
 	cfg.Backend = configfile.BackendDolt
-	cfg.DoltMode = configfile.DoltModeEmbedded
 	if err := cfg.Save(beadsDir); err != nil {
 		t.Fatalf("failed to save config: %v", err)
 	}
@@ -331,7 +295,7 @@ func TestDoltSetConfigJSONOutput(t *testing.T) {
 	defer func() { jsonOutput = origJsonOutput }()
 	jsonOutput = true
 
-	output := captureDoltSetOutput(t, "mode", "server", false)
+	output := captureDoltSetOutput(t, "database", "myproject", false)
 
 	if output == "" {
 		t.Skip("output capture failed")
@@ -342,11 +306,11 @@ func TestDoltSetConfigJSONOutput(t *testing.T) {
 		t.Skipf("output not pure JSON: %s", output)
 	}
 
-	if result["key"] != "mode" {
-		t.Errorf("expected key 'mode', got %v", result["key"])
+	if result["key"] != "database" {
+		t.Errorf("expected key 'database', got %v", result["key"])
 	}
-	if result["value"] != "server" {
-		t.Errorf("expected value 'server', got %v", result["value"])
+	if result["value"] != "myproject" {
+		t.Errorf("expected value 'myproject', got %v", result["value"])
 	}
 	if result["location"] != "metadata.json" {
 		t.Errorf("expected location 'metadata.json', got %v", result["location"])
@@ -387,7 +351,7 @@ func TestDoltSetConfigWithUpdateConfig(t *testing.T) {
 	jsonOutput = true
 
 	// Set with --update-config
-	output := captureDoltSetOutput(t, "mode", "server", true)
+	output := captureDoltSetOutput(t, "database", "myproject", true)
 
 	if output == "" {
 		t.Skip("output capture failed")
@@ -417,6 +381,8 @@ func TestTestServerConnection(t *testing.T) {
 	})
 
 	t.Run("localhost with unlikely port", func(t *testing.T) {
+		// Clear test server port override so GetDoltServerPort() returns 59999
+		t.Setenv("BEADS_DOLT_SERVER_PORT", "")
 		cfg := configfile.DefaultConfig()
 		cfg.DoltServerHost = "127.0.0.1"
 		cfg.DoltServerPort = 59999 // Unlikely to be in use
@@ -464,6 +430,8 @@ func TestDoltConfigGetters(t *testing.T) {
 	})
 
 	t.Run("GetDoltServerPort defaults", func(t *testing.T) {
+		// Clear test server port override so GetDoltServerPort() returns the struct default
+		t.Setenv("BEADS_DOLT_SERVER_PORT", "")
 		cfg := configfile.DefaultConfig()
 		if cfg.GetDoltServerPort() != configfile.DefaultDoltServerPort {
 			t.Errorf("expected default port %d, got %d",
@@ -542,6 +510,61 @@ func TestDoltConfigEnvironmentOverrides(t *testing.T) {
 	})
 }
 
+func TestDoltServerPidFile(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("failed to create .beads dir: %v", err)
+	}
+
+	pidFile := doltServerPidFile(beadsDir)
+	expected := filepath.Join(beadsDir, "dolt", "dolt-server.pid")
+	if pidFile != expected {
+		t.Errorf("doltServerPidFile() = %s, want %s", pidFile, expected)
+	}
+}
+
+func TestIsDoltServerRunningByPid(t *testing.T) {
+	t.Run("missing PID file", func(t *testing.T) {
+		pid, alive := isDoltServerRunningByPid("/nonexistent/path/dolt-server.pid")
+		if pid != 0 || alive {
+			t.Errorf("expected pid=0, alive=false for missing file; got pid=%d, alive=%v", pid, alive)
+		}
+	})
+
+	t.Run("invalid PID content", func(t *testing.T) {
+		tmpFile := filepath.Join(t.TempDir(), "dolt-server.pid")
+		os.WriteFile(tmpFile, []byte("not-a-number"), 0600)
+		pid, alive := isDoltServerRunningByPid(tmpFile)
+		if pid != 0 || alive {
+			t.Errorf("expected pid=0, alive=false for invalid content; got pid=%d, alive=%v", pid, alive)
+		}
+	})
+
+	t.Run("current process PID is alive", func(t *testing.T) {
+		tmpFile := filepath.Join(t.TempDir(), "dolt-server.pid")
+		// Use our own PID — guaranteed to be alive
+		myPid := os.Getpid()
+		os.WriteFile(tmpFile, []byte(strconv.Itoa(myPid)), 0600)
+		pid, alive := isDoltServerRunningByPid(tmpFile)
+		if pid != myPid || !alive {
+			t.Errorf("expected pid=%d, alive=true for current process; got pid=%d, alive=%v", myPid, pid, alive)
+		}
+	})
+
+	t.Run("dead PID", func(t *testing.T) {
+		tmpFile := filepath.Join(t.TempDir(), "dolt-server.pid")
+		// PID 99999999 is extremely unlikely to be a real process
+		os.WriteFile(tmpFile, []byte("99999999"), 0600)
+		pid, alive := isDoltServerRunningByPid(tmpFile)
+		if pid != 99999999 {
+			t.Errorf("expected pid=99999999, got pid=%d", pid)
+		}
+		if alive {
+			t.Error("expected alive=false for dead PID")
+		}
+	})
+}
+
 // Helper functions
 
 func captureDoltShowOutput(t *testing.T) string {
@@ -592,6 +615,62 @@ func captureDoltSetOutput(t *testing.T, key, value string, updateConfig bool) st
 	io.Copy(&buf, r)
 
 	return buf.String()
+}
+
+// TestSetDoltConfigWorktreeIsolation verifies that setDoltConfig writes to
+// BEADS_DIR (the test temp directory), not the main repo's .beads directory.
+// This is a regression test for bd-la2cl: test values (10.0.0.1:3309, mydb)
+// were being written to the production metadata.json in worktree environments
+// because FindBeadsDir() resolves to the main repo root.
+func TestSetDoltConfigWorktreeIsolation(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("failed to create .beads dir: %v", err)
+	}
+
+	// Create metadata.json with Dolt backend
+	cfg := configfile.DefaultConfig()
+	cfg.Backend = configfile.BackendDolt
+	cfg.DoltMode = configfile.DoltModeServer
+	cfg.DoltServerHost = "127.0.0.1"
+	cfg.DoltServerPort = 3307
+	cfg.DoltDatabase = "beads"
+	if err := cfg.Save(beadsDir); err != nil {
+		t.Fatalf("failed to save config: %v", err)
+	}
+
+	// CRITICAL: Set BEADS_DIR so FindBeadsDir() returns our temp .beads,
+	// not the main repo's .beads (which happens in worktree environments).
+	t.Setenv("BEADS_DIR", beadsDir)
+
+	oldCwd, _ := os.Getwd()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir: %v", err)
+	}
+	defer func() { _ = os.Chdir(oldCwd) }()
+
+	// Write test values via setDoltConfig
+	setDoltConfig("host", "192.168.99.99", false)
+	setDoltConfig("port", "9999", false)
+	setDoltConfig("database", "testdb", false)
+
+	// Verify values were written to the TEMP directory's metadata.json
+	loadedCfg, err := configfile.Load(beadsDir)
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+	if loadedCfg.DoltServerHost != "192.168.99.99" {
+		t.Errorf("test values not written to temp beadsDir: host = %s", loadedCfg.DoltServerHost)
+	}
+
+	// Verify the main repo's metadata.json was NOT modified.
+	// FindBeadsDir() without BEADS_DIR override would return the main repo's .beads.
+	// We can't easily test this in all environments, but we verify by checking that
+	// the values we wrote don't match the "known bad" test values from the original bug.
+	if loadedCfg.DoltServerHost == "10.0.0.1" && loadedCfg.DoltServerPort == 3309 {
+		t.Error("REGRESSION: test values match the known-bad production corruption values (10.0.0.1:3309)")
+	}
 }
 
 func containsAny(s string, substrs ...string) bool {

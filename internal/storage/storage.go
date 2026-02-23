@@ -17,6 +17,72 @@ import (
 // claimed by another user. The error message contains the current assignee.
 var ErrAlreadyClaimed = errors.New("issue already claimed")
 
+// ErrNotFound is returned when a requested entity does not exist in the database.
+var ErrNotFound = errors.New("not found")
+
+// ErrNotInitialized is returned when the database has not been initialized
+// (e.g., issue_prefix config is missing).
+var ErrNotInitialized = errors.New("database not initialized")
+
+// ErrPrefixMismatch is returned when an issue ID does not match the configured prefix.
+var ErrPrefixMismatch = errors.New("prefix mismatch")
+
+// Storage is the interface satisfied by *dolt.DoltStore.
+// Consumers depend on this interface rather than on the concrete type so that
+// alternative implementations (mocks, proxies, etc.) can be substituted.
+type Storage interface {
+	// Issue CRUD
+	CreateIssue(ctx context.Context, issue *types.Issue, actor string) error
+	CreateIssues(ctx context.Context, issues []*types.Issue, actor string) error
+	GetIssue(ctx context.Context, id string) (*types.Issue, error)
+	GetIssueByExternalRef(ctx context.Context, externalRef string) (*types.Issue, error)
+	GetIssuesByIDs(ctx context.Context, ids []string) ([]*types.Issue, error)
+	UpdateIssue(ctx context.Context, id string, updates map[string]interface{}, actor string) error
+	CloseIssue(ctx context.Context, id string, reason string, actor string, session string) error
+	DeleteIssue(ctx context.Context, id string) error
+	SearchIssues(ctx context.Context, query string, filter types.IssueFilter) ([]*types.Issue, error)
+
+	// Dependencies
+	AddDependency(ctx context.Context, dep *types.Dependency, actor string) error
+	RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error
+	GetDependencies(ctx context.Context, issueID string) ([]*types.Issue, error)
+	GetDependents(ctx context.Context, issueID string) ([]*types.Issue, error)
+	GetDependenciesWithMetadata(ctx context.Context, issueID string) ([]*types.IssueWithDependencyMetadata, error)
+	GetDependentsWithMetadata(ctx context.Context, issueID string) ([]*types.IssueWithDependencyMetadata, error)
+	GetDependencyTree(ctx context.Context, issueID string, maxDepth int, showAllPaths bool, reverse bool) ([]*types.TreeNode, error)
+
+	// Labels
+	AddLabel(ctx context.Context, issueID, label, actor string) error
+	RemoveLabel(ctx context.Context, issueID, label, actor string) error
+	GetLabels(ctx context.Context, issueID string) ([]string, error)
+	GetIssuesByLabel(ctx context.Context, label string) ([]*types.Issue, error)
+
+	// Work queries
+	GetReadyWork(ctx context.Context, filter types.WorkFilter) ([]*types.Issue, error)
+	GetBlockedIssues(ctx context.Context, filter types.WorkFilter) ([]*types.BlockedIssue, error)
+	GetEpicsEligibleForClosure(ctx context.Context) ([]*types.EpicStatus, error)
+
+	// Comments and events
+	AddIssueComment(ctx context.Context, issueID, author, text string) (*types.Comment, error)
+	GetIssueComments(ctx context.Context, issueID string) ([]*types.Comment, error)
+	GetEvents(ctx context.Context, issueID string, limit int) ([]*types.Event, error)
+	GetAllEventsSince(ctx context.Context, sinceID int64) ([]*types.Event, error)
+
+	// Statistics
+	GetStatistics(ctx context.Context) (*types.Statistics, error)
+
+	// Configuration
+	SetConfig(ctx context.Context, key, value string) error
+	GetConfig(ctx context.Context, key string) (string, error)
+	GetAllConfig(ctx context.Context) (map[string]string, error)
+
+	// Transactions
+	RunInTransaction(ctx context.Context, commitMsg string, fn func(tx Transaction) error) error
+
+	// Lifecycle
+	Close() error
+}
+
 // Transaction provides atomic multi-operation support within a single database transaction.
 //
 // The Transaction interface exposes a subset of storage methods that execute within
@@ -33,7 +99,7 @@ var ErrAlreadyClaimed = errors.New("issue already claimed")
 //
 // # Example Usage
 //
-//	err := store.RunInTransaction(ctx, func(tx storage.Transaction) error {
+//	err := store.RunInTransaction(ctx, "bd: create parent and child", func(tx storage.Transaction) error {
 //	    // Create parent issue
 //	    if err := tx.CreateIssue(ctx, parentIssue, actor); err != nil {
 //	        return err // Triggers rollback

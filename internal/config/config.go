@@ -36,8 +36,18 @@ func Initialize() error {
 	v.SetConfigType("yaml")
 
 	// Explicitly locate config.yaml and use SetConfigFile to avoid picking up config.json
-	// Precedence: project .beads/config.yaml > ~/.config/bd/config.yaml > ~/.beads/config.yaml
+	// Precedence: BEADS_DIR > project .beads/config.yaml > ~/.config/bd/config.yaml > ~/.beads/config.yaml
 	configFileSet := false
+
+	// 0. Check BEADS_DIR first (highest priority)
+	// This ensures bd commands with BEADS_DIR set find the correct config
+	if beadsDir := os.Getenv("BEADS_DIR"); beadsDir != "" && !configFileSet {
+		configPath := filepath.Join(beadsDir, "config.yaml")
+		if _, err := os.Stat(configPath); err == nil {
+			v.SetConfigFile(configPath)
+			configFileSet = true
+		}
+	}
 
 	// 1. Walk up from CWD to find project .beads/config.yaml
 	//    This allows commands to work from subdirectories
@@ -120,15 +130,8 @@ func Initialize() error {
 	v.SetDefault("actor", "")
 	v.SetDefault("issue-prefix", "")
 	// Additional environment variables (not prefixed with BD_)
-	// These are bound explicitly for backward compatibility
-	_ = v.BindEnv("flush-debounce", "BEADS_FLUSH_DEBOUNCE")             // BindEnv only fails with zero args, which can't happen here
-	_ = v.BindEnv("identity", "BEADS_IDENTITY")                         // BindEnv only fails with zero args, which can't happen here
-	_ = v.BindEnv("remote-sync-interval", "BEADS_REMOTE_SYNC_INTERVAL") // BindEnv only fails with zero args, which can't happen here
-
-	// Set defaults for additional settings
-	v.SetDefault("flush-debounce", "30s")
+	_ = v.BindEnv("identity", "BEADS_IDENTITY") // BindEnv only fails with zero args, which can't happen here
 	v.SetDefault("identity", "")
-	v.SetDefault("remote-sync-interval", "30s")
 
 	// Dolt configuration defaults
 	// Controls whether beads should automatically create Dolt commits after write commands.
@@ -146,7 +149,7 @@ func Initialize() error {
 
 	// Sync mode configuration (hq-ew1mbr.3)
 	// See docs/CONFIG.md for detailed documentation
-	v.SetDefault("sync.mode", SyncModeGitPortable)  // git-portable | realtime | dolt-native | belt-and-suspenders
+	v.SetDefault("sync.mode", SyncModeDoltNative)
 	v.SetDefault("sync.export_on", SyncTriggerPush) // push | change
 	v.SetDefault("sync.import_on", SyncTriggerPull) // pull | change
 
@@ -392,7 +395,7 @@ func SaveConfigValue(key string, value interface{}, beadsDir string) error {
 	// Read existing file contents to avoid dumping all merged viper state
 	// (defaults, env vars, overrides) into the config file.
 	existing := make(map[string]interface{})
-	if data, err := os.ReadFile(configPath); err == nil {
+	if data, err := os.ReadFile(filepath.Clean(configPath)); err == nil {
 		_ = yaml.Unmarshal(data, &existing)
 	}
 
@@ -403,7 +406,7 @@ func SaveConfigValue(key string, value interface{}, beadsDir string) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
-	return os.WriteFile(configPath, out, 0o644)
+	return os.WriteFile(configPath, out, 0o600)
 }
 
 // setNestedKey sets a value in a nested map using a dot-separated key path.
@@ -650,7 +653,7 @@ func GetIdentity(flagValue string) string {
 
 // SyncConfig holds the sync mode configuration.
 type SyncConfig struct {
-	Mode     SyncMode // git-portable, realtime, dolt-native, belt-and-suspenders
+	Mode     SyncMode // dolt-native (only supported mode)
 	ExportOn string   // push, change
 	ImportOn string   // pull, change
 }
@@ -739,56 +742,6 @@ func GetFederationConfig() FederationConfig {
 		Remote:      GetString("federation.remote"),
 		Sovereignty: GetSovereignty(),
 	}
-}
-
-// IsSyncModeValid checks if the given sync mode string is valid.
-func IsSyncModeValid(mode string) bool {
-	return validSyncModes[SyncMode(mode)]
-}
-
-// IsConflictStrategyValid checks if the given conflict strategy string is valid.
-func IsConflictStrategyValid(strategy string) bool {
-	return validConflictStrategies[ConflictStrategy(strategy)]
-}
-
-// IsSovereigntyValid checks if the given sovereignty tier string is valid.
-// Note: empty string is valid (means no restriction).
-func IsSovereigntyValid(sovereignty string) bool {
-	if sovereignty == "" {
-		return true
-	}
-	return validSovereigntyTiers[Sovereignty(sovereignty)]
-}
-
-// ShouldExportOnChange returns true if sync.export_on is set to "change".
-func ShouldExportOnChange() bool {
-	return GetString("sync.export_on") == SyncTriggerChange
-}
-
-// ShouldImportOnChange returns true if sync.import_on is set to "change".
-func ShouldImportOnChange() bool {
-	return GetString("sync.import_on") == SyncTriggerChange
-}
-
-// NeedsDoltRemote returns true if the sync mode requires a Dolt remote.
-func NeedsDoltRemote() bool {
-	mode := GetSyncMode()
-	return mode == SyncModeDoltNative || mode == SyncModeBeltAndSuspenders
-}
-
-// NeedsJSONL returns true if the sync mode requires JSONL export.
-func NeedsJSONL() bool {
-	mode := GetSyncMode()
-	return mode == SyncModeGitPortable || mode == SyncModeRealtime || mode == SyncModeBeltAndSuspenders
-}
-
-// NeedsJSONLImport returns true if the sync mode should import from JSONL.
-// In dolt-native mode, imports are disabled to prevent stale JSONL from
-// overwriting dolt data. This is for use by internal/rpc which can't
-// import cmd/bd.
-func NeedsJSONLImport() bool {
-	mode := GetSyncMode()
-	return mode != SyncModeDoltNative
 }
 
 // GetCustomTypesFromYAML retrieves custom issue types from config.yaml.

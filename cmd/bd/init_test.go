@@ -13,12 +13,24 @@ import (
 	"testing"
 
 	"github.com/steveyegge/beads/internal/beads"
-	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
+// skipIfNoDolt skips the test when no Dolt server is available.
+// Checks both binary availability and test server status.
+func skipIfNoDolt(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("dolt"); err != nil {
+		t.Skip("skipping: dolt not installed")
+	}
+	if testDoltServerPort == 0 {
+		t.Skip("skipping: Dolt test server not running")
+	}
+}
+
 func TestInitCommand(t *testing.T) {
+	skipIfNoDolt(t)
 	tests := []struct {
 		name           string
 		prefix         string
@@ -143,10 +155,8 @@ func TestInitCommand(t *testing.T) {
 					"daemon.log",
 					"daemon.pid",
 					"bd.sock",
-					"beads.base.jsonl",
-					"beads.left.jsonl",
-					"beads.right.jsonl",
-					"Do NOT add negation patterns", // Comment explaining fork protection
+					"dolt/",
+					"dolt-access.lock",
 				}
 				for _, pattern := range expectedPatterns {
 					if !strings.Contains(gitignoreStr, pattern) {
@@ -174,248 +184,9 @@ func TestInitCommand(t *testing.T) {
 
 // Note: Error case testing is omitted because the init command calls os.Exit()
 // on errors, which makes it difficult to test in a unit test context.
-// GH#807: Rejection of main/master as sync branch is tested at unit level in
-// internal/syncbranch/syncbranch_test.go (TestValidateSyncBranchName, TestSet).
-
-// TestInitSyncBranch groups sync-branch related init tests.
-// GH#807: Verifies --branch flag behavior (rejection of main/master tested at unit level)
-func TestInitSyncBranch(t *testing.T) {
-	// resetInitState is a helper to reset global state for each subtest.
-	resetInitState := func(t *testing.T) {
-		t.Helper()
-		origDBPath := dbPath
-		t.Cleanup(func() { dbPath = origDBPath })
-		dbPath = ""
-		initCmd.Flags().Set("branch", "")
-		initCmd.Flags().Set("force", "false")
-	}
-
-	t.Run("BranchFlagSetsSyncBranch", func(t *testing.T) {
-		resetInitState(t)
-
-		tmpDir := t.TempDir()
-		t.Chdir(tmpDir)
-
-		if err := runCommandInDir(tmpDir, "git", "init", "--initial-branch=dev"); err != nil {
-			t.Fatalf("Failed to init git: %v", err)
-		}
-
-		rootCmd.SetArgs([]string{"init", "--prefix", "test", "--branch", "beads-sync", "--quiet"})
-		if err := rootCmd.Execute(); err != nil {
-			t.Fatalf("Init with --branch failed: %v", err)
-		}
-
-		dbFilePath := filepath.Join(tmpDir, ".beads", "dolt")
-		store, err := openExistingTestDB(t, dbFilePath)
-		if err != nil {
-			t.Fatalf("Failed to open database: %v", err)
-		}
-		defer store.Close()
-
-		ctx := context.Background()
-		syncBranch, err := store.GetConfig(ctx, "sync.branch")
-		if err != nil {
-			t.Fatalf("Failed to get sync.branch from database: %v", err)
-		}
-		if syncBranch != "beads-sync" {
-			t.Errorf("Expected sync.branch 'beads-sync', got %q", syncBranch)
-		}
-	})
-
-	// Verifies that init with --branch sets up .git/info/exclude to hide
-	// untracked JSONL files from git status.
-	t.Run("BranchFlagSetsGitExclude", func(t *testing.T) {
-		resetInitState(t)
-
-		tmpDir := t.TempDir()
-		t.Chdir(tmpDir)
-
-		if err := runCommandInDir(tmpDir, "git", "init", "--initial-branch=dev"); err != nil {
-			t.Fatalf("Failed to init git: %v", err)
-		}
-		_ = runCommandInDir(tmpDir, "git", "config", "user.email", "test@test.com")
-		_ = runCommandInDir(tmpDir, "git", "config", "user.name", "Test")
-
-		rootCmd.SetArgs([]string{"init", "--prefix", "test", "--branch", "beads-sync", "--quiet"})
-		if err := rootCmd.Execute(); err != nil {
-			t.Fatalf("Init with --branch failed: %v", err)
-		}
-
-		excludePath := filepath.Join(tmpDir, ".git", "info", "exclude")
-		content, err := os.ReadFile(excludePath)
-		if err != nil {
-			t.Fatalf("Failed to read .git/info/exclude: %v", err)
-		}
-
-		excludeContent := string(content)
-		if !strings.Contains(excludeContent, ".beads/interactions.jsonl") {
-			t.Errorf("Expected .git/info/exclude to contain '.beads/interactions.jsonl', got:\n%s", excludeContent)
-		}
-	})
-
-	// Verifies that init without --branch flag still sets git index flags when
-	// sync-branch is already configured in config.yaml (fresh clone scenario).
-	t.Run("ExistingSyncBranchConfig", func(t *testing.T) {
-		resetInitState(t)
-
-		tmpDir := t.TempDir()
-		t.Chdir(tmpDir)
-
-		if err := runCommandInDir(tmpDir, "git", "init", "--initial-branch=dev"); err != nil {
-			t.Fatalf("Failed to init git: %v", err)
-		}
-		_ = runCommandInDir(tmpDir, "git", "config", "user.email", "test@test.com")
-		_ = runCommandInDir(tmpDir, "git", "config", "user.name", "Test")
-
-		beadsDir := filepath.Join(tmpDir, ".beads")
-		if err := os.MkdirAll(beadsDir, 0755); err != nil {
-			t.Fatalf("Failed to create .beads dir: %v", err)
-		}
-		configYaml := `sync-branch: "beads-sync"
-`
-		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configYaml), 0644); err != nil {
-			t.Fatalf("Failed to write config.yaml: %v", err)
-		}
-		if err := os.WriteFile(filepath.Join(beadsDir, "interactions.jsonl"), []byte{}, 0644); err != nil {
-			t.Fatalf("Failed to write interactions.jsonl: %v", err)
-		}
-
-		rootCmd.SetArgs([]string{"init", "--prefix", "test", "--quiet", "--force"})
-		if err := rootCmd.Execute(); err != nil {
-			t.Fatalf("Init failed: %v", err)
-		}
-
-		excludePath := filepath.Join(tmpDir, ".git", "info", "exclude")
-		content, err := os.ReadFile(excludePath)
-		if err != nil {
-			t.Fatalf("Failed to read .git/info/exclude: %v", err)
-		}
-
-		excludeContent := string(content)
-		if !strings.Contains(excludeContent, ".beads/interactions.jsonl") {
-			t.Errorf("Expected .git/info/exclude to contain '.beads/interactions.jsonl' when sync-branch is in config.yaml, got:\n%s", excludeContent)
-		}
-	})
-
-	// Verifies that sync.branch is NOT auto-set when --branch is omitted.
-	// GH#807: This was the root cause - init was auto-detecting current branch (e.g., main)
-	t.Run("WithoutBranchFlag", func(t *testing.T) {
-		resetInitState(t)
-
-		tmpDir := t.TempDir()
-		t.Chdir(tmpDir)
-
-		if err := runCommandInDir(tmpDir, "git", "init", "--initial-branch=main"); err != nil {
-			t.Fatalf("Failed to init git: %v", err)
-		}
-
-		rootCmd.SetArgs([]string{"init", "--prefix", "test", "--quiet"})
-		if err := rootCmd.Execute(); err != nil {
-			t.Fatalf("Init failed: %v", err)
-		}
-
-		dbFilePath := filepath.Join(tmpDir, ".beads", "dolt")
-		store, err := openExistingTestDB(t, dbFilePath)
-		if err != nil {
-			t.Fatalf("Failed to open database: %v", err)
-		}
-		defer store.Close()
-
-		ctx := context.Background()
-		syncBranch, err := store.GetConfig(ctx, "sync.branch")
-		if err != nil {
-			t.Fatalf("Failed to get sync.branch from database: %v", err)
-		}
-		if syncBranch != "" {
-			t.Errorf("Expected sync.branch to be empty (not auto-detected), got %q", syncBranch)
-		}
-	})
-
-	// Verifies that --branch flag persists to config.yaml.
-	t.Run("BranchPersistsToConfigYaml", func(t *testing.T) {
-		resetInitState(t)
-
-		tmpDir := t.TempDir()
-		t.Chdir(tmpDir)
-
-		if err := runCommandInDir(tmpDir, "git", "init", "--initial-branch=dev"); err != nil {
-			t.Fatalf("Failed to init git: %v", err)
-		}
-
-		rootCmd.SetArgs([]string{"init", "--prefix", "test", "--branch", "beads-sync", "--quiet"})
-		if err := rootCmd.Execute(); err != nil {
-			t.Fatalf("Init with --branch failed: %v", err)
-		}
-
-		configPath := filepath.Join(tmpDir, ".beads", "config.yaml")
-		content, err := os.ReadFile(configPath)
-		if err != nil {
-			t.Fatalf("Failed to read config.yaml: %v", err)
-		}
-
-		configStr := string(content)
-
-		if strings.Contains(configStr, "# sync-branch:") && !strings.Contains(configStr, "\nsync-branch:") {
-			t.Errorf("BUG: --branch flag did not persist to config.yaml\n" +
-				"Expected uncommented 'sync-branch: \"beads-sync\"'\n" +
-				"Got commented '# sync-branch:' (only set in database, not config.yaml)")
-		}
-
-		if !strings.Contains(configStr, "sync-branch: \"beads-sync\"") {
-			t.Errorf("config.yaml should contain 'sync-branch: \"beads-sync\"', got:\n%s", configStr)
-		}
-	})
-
-	// Verifies that --branch flag works on reinit.
-	// GH#927: When reinitializing with --branch, config.yaml should be updated even if it exists.
-	t.Run("ReinitWithBranch", func(t *testing.T) {
-		resetInitState(t)
-
-		tmpDir := t.TempDir()
-		t.Chdir(tmpDir)
-
-		if err := runCommandInDir(tmpDir, "git", "init", "--initial-branch=dev"); err != nil {
-			t.Fatalf("Failed to init git: %v", err)
-		}
-
-		// First init WITHOUT --branch
-		rootCmd.SetArgs([]string{"init", "--prefix", "test", "--quiet"})
-		if err := rootCmd.Execute(); err != nil {
-			t.Fatalf("First init failed: %v", err)
-		}
-
-		configPath := filepath.Join(tmpDir, ".beads", "config.yaml")
-		content, err := os.ReadFile(configPath)
-		if err != nil {
-			t.Fatalf("Failed to read config.yaml: %v", err)
-		}
-		if !strings.Contains(string(content), "# sync-branch:") {
-			t.Errorf("Initial config.yaml should have commented sync-branch")
-		}
-
-		// Reset Cobra flags for reinit
-		initCmd.Flags().Set("branch", "")
-		initCmd.Flags().Set("force", "false")
-
-		// Reinit WITH --branch
-		rootCmd.SetArgs([]string{"init", "--prefix", "test", "--branch", "beads-sync", "--force", "--quiet"})
-		if err := rootCmd.Execute(); err != nil {
-			t.Fatalf("Reinit with --branch failed: %v", err)
-		}
-
-		content, err = os.ReadFile(configPath)
-		if err != nil {
-			t.Fatalf("Failed to read config.yaml after reinit: %v", err)
-		}
-
-		configStr := string(content)
-		if !strings.Contains(configStr, "sync-branch: \"beads-sync\"") {
-			t.Errorf("After reinit with --branch, config.yaml should contain uncommented 'sync-branch: \"beads-sync\"', got:\n%s", configStr)
-		}
-	})
-}
 
 func TestInitAlreadyInitialized(t *testing.T) {
+	skipIfNoDolt(t)
 	// Reset global state
 	origDBPath := dbPath
 	defer func() { dbPath = origDBPath }()
@@ -604,206 +375,6 @@ func TestInitWithCustomDBPath(t *testing.T) {
 	})
 }
 
-func TestInitNoDbMode(t *testing.T) {
-	t.Skip("no-db mode has been removed; beads now requires Dolt")
-	// Reset global state
-	origDBPath := dbPath
-	origNoDb := noDb
-	defer func() {
-		dbPath = origDBPath
-		noDb = origNoDb
-	}()
-	dbPath = ""
-	noDb = false
-
-	// Reset Cobra flags - critical for --no-db to work correctly
-	rootCmd.PersistentFlags().Set("no-db", "false")
-
-	tmpDir := t.TempDir()
-	t.Chdir(tmpDir)
-
-	// Set BEADS_DIR to prevent git repo detection from finding project's .beads
-	origBeadsDir := os.Getenv("BEADS_DIR")
-	os.Setenv("BEADS_DIR", filepath.Join(tmpDir, ".beads"))
-	// Reset caches so RepoContext picks up new BEADS_DIR and CWD
-	beads.ResetCaches()
-	git.ResetCaches()
-	defer func() {
-		if origBeadsDir != "" {
-			os.Setenv("BEADS_DIR", origBeadsDir)
-		} else {
-			os.Unsetenv("BEADS_DIR")
-		}
-		// Reset caches on cleanup too
-		beads.ResetCaches()
-		git.ResetCaches()
-	}()
-
-	// Initialize with --no-db flag
-	rootCmd.SetArgs([]string{"init", "--no-db", "--prefix", "test", "--quiet"})
-
-	t.Logf("DEBUG: noDb before Execute=%v", noDb)
-
-	if err := rootCmd.Execute(); err != nil {
-		t.Fatalf("Init with --no-db failed: %v", err)
-	}
-
-	t.Logf("DEBUG: noDb after Execute=%v", noDb)
-
-	// Debug: Check where files were created
-	beadsDirEnv := os.Getenv("BEADS_DIR")
-	t.Logf("DEBUG: tmpDir=%s", tmpDir)
-	t.Logf("DEBUG: BEADS_DIR=%s", beadsDirEnv)
-	t.Logf("DEBUG: CWD=%s", func() string { cwd, _ := os.Getwd(); return cwd }())
-
-	// Check what files exist in tmpDir
-	entries, _ := os.ReadDir(tmpDir)
-	t.Logf("DEBUG: entries in tmpDir: %v", entries)
-	if beadsDirEnv != "" {
-		beadsEntries, err := os.ReadDir(beadsDirEnv)
-		t.Logf("DEBUG: entries in BEADS_DIR: %v (err: %v)", beadsEntries, err)
-	}
-
-	// Verify issues.jsonl was created
-	jsonlPath := filepath.Join(tmpDir, ".beads", "issues.jsonl")
-	if _, err := os.Stat(jsonlPath); os.IsNotExist(err) {
-		// Also check at BEADS_DIR directly
-		beadsDirJsonlPath := filepath.Join(beadsDirEnv, "issues.jsonl")
-		if _, err2 := os.Stat(beadsDirJsonlPath); err2 == nil {
-			t.Logf("DEBUG: issues.jsonl found at BEADS_DIR path: %s", beadsDirJsonlPath)
-		}
-		t.Error("issues.jsonl was not created in --no-db mode")
-	}
-
-	// Verify config.yaml was created with no-db: true
-	configPath := filepath.Join(tmpDir, ".beads", "config.yaml")
-	configContent, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatalf("Failed to read config.yaml: %v", err)
-	}
-
-	configStr := string(configContent)
-	if !strings.Contains(configStr, "no-db: true") {
-		t.Error("config.yaml should contain 'no-db: true' in --no-db mode")
-	}
-	if !strings.Contains(configStr, "issue-prefix:") {
-		t.Error("config.yaml should contain issue-prefix in --no-db mode")
-	}
-
-	// Reset config so it picks up the newly created config.yaml
-	// (simulates a new process invocation which would load fresh config)
-	initConfigForTest(t)
-
-	// Verify config has correct values
-	if !config.GetBool("no-db") {
-		t.Error("config should have no-db=true after init --no-db")
-	}
-	if config.GetString("issue-prefix") != "test" {
-		t.Errorf("config should have issue-prefix='test', got %q", config.GetString("issue-prefix"))
-	}
-
-	// NOTE: Testing subsequent command execution in the same process is complex
-	// due to cobra's flag caching and global state. The key functionality
-	// (init creating proper config.yaml for no-db mode) is verified above.
-	// Real-world usage works correctly since each command is a fresh process.
-
-	// Verify no SQLite database was created
-	dbPath := filepath.Join(tmpDir, ".beads", "beads.db")
-	if _, err := os.Stat(dbPath); err == nil {
-		t.Error("SQLite database should not be created in --no-db mode")
-	}
-}
-
-// TestInitMergeDriverAutoConfiguration removed: merge driver functions
-// (mergeDriverInstalled, installMergeDriver) were removed in Dolt-native pruning.
-
-// TestReadFirstIssueFromJSONL_ValidFile verifies reading first issue from valid JSONL
-func TestReadFirstIssueFromJSONL_ValidFile(t *testing.T) {
-	tempDir := t.TempDir()
-	jsonlPath := filepath.Join(tempDir, "test.jsonl")
-
-	// Create test JSONL file with multiple issues
-	content := `{"id":"bd-1","title":"First Issue","description":"First test"}
-{"id":"bd-2","title":"Second Issue","description":"Second test"}
-{"id":"bd-3","title":"Third Issue","description":"Third test"}
-`
-	if err := os.WriteFile(jsonlPath, []byte(content), 0o600); err != nil {
-		t.Fatalf("Failed to write test file: %v", err)
-	}
-
-	issue, err := readFirstIssueFromJSONL(jsonlPath)
-	if err != nil {
-		t.Fatalf("readFirstIssueFromJSONL failed: %v", err)
-	}
-
-	if issue == nil {
-		t.Fatal("Expected non-nil issue, got nil")
-	}
-
-	// Verify we got the FIRST issue
-	if issue.ID != "bd-1" {
-		t.Errorf("Expected ID 'bd-1', got '%s'", issue.ID)
-	}
-	if issue.Title != "First Issue" {
-		t.Errorf("Expected title 'First Issue', got '%s'", issue.Title)
-	}
-	if issue.Description != "First test" {
-		t.Errorf("Expected description 'First test', got '%s'", issue.Description)
-	}
-}
-
-// TestReadFirstIssueFromJSONL_EmptyLines verifies skipping empty lines
-func TestReadFirstIssueFromJSONL_EmptyLines(t *testing.T) {
-	tempDir := t.TempDir()
-	jsonlPath := filepath.Join(tempDir, "test.jsonl")
-
-	// Create JSONL with empty lines before first valid issue
-	content := `
-
-{"id":"bd-1","title":"First Valid Issue"}
-{"id":"bd-2","title":"Second Issue"}
-`
-	if err := os.WriteFile(jsonlPath, []byte(content), 0o600); err != nil {
-		t.Fatalf("Failed to write test file: %v", err)
-	}
-
-	issue, err := readFirstIssueFromJSONL(jsonlPath)
-	if err != nil {
-		t.Fatalf("readFirstIssueFromJSONL failed: %v", err)
-	}
-
-	if issue == nil {
-		t.Fatal("Expected non-nil issue, got nil")
-	}
-
-	if issue.ID != "bd-1" {
-		t.Errorf("Expected ID 'bd-1', got '%s'", issue.ID)
-	}
-	if issue.Title != "First Valid Issue" {
-		t.Errorf("Expected title 'First Valid Issue', got '%s'", issue.Title)
-	}
-}
-
-// TestReadFirstIssueFromJSONL_EmptyFile verifies handling of empty file
-func TestReadFirstIssueFromJSONL_EmptyFile(t *testing.T) {
-	tempDir := t.TempDir()
-	jsonlPath := filepath.Join(tempDir, "empty.jsonl")
-
-	// Create empty file
-	if err := os.WriteFile(jsonlPath, []byte(""), 0o600); err != nil {
-		t.Fatalf("Failed to write test file: %v", err)
-	}
-
-	issue, err := readFirstIssueFromJSONL(jsonlPath)
-	if err != nil {
-		t.Fatalf("readFirstIssueFromJSONL should not error on empty file: %v", err)
-	}
-
-	if issue != nil {
-		t.Errorf("Expected nil issue for empty file, got %+v", issue)
-	}
-}
-
 // TestSetupClaudeSettings_InvalidJSON verifies that invalid JSON in existing
 // settings.local.json returns an error instead of silently overwriting.
 // This is a regression test for bd-5bj where user settings were lost.
@@ -949,13 +520,6 @@ func TestSetupClaudeSettings_NoExistingFile(t *testing.T) {
 	}
 }
 
-// TestInitBranchPersistsToConfigYaml verifies that --branch flag persists to config.yaml
-// GH#927 Bug 3: The --branch flag sets sync.branch in database but NOT in config.yaml.
-// This matters because config.yaml is version-controlled and shared across clones,
-// while the database is local and gitignored.
-// Note: TestInitBranchPersistsToConfigYaml and TestInitReinitWithBranch are now
-// subtests of TestInitSyncBranch above.
-
 // setupIsolatedGitConfig creates an empty git config in tmpDir and sets GIT_CONFIG_GLOBAL
 // to prevent tests from using the real user's global git config.
 func setupIsolatedGitConfig(t *testing.T, tmpDir string) {
@@ -1074,13 +638,8 @@ func captureStdout(t *testing.T, fn func() error) string {
 // TestInitPromptRoleConfig tests the beads.role git config read/write functions
 func TestInitPromptRoleConfig(t *testing.T) {
 	t.Run("getBeadsRole returns empty when not configured", func(t *testing.T) {
-		tmpDir := t.TempDir()
+		tmpDir := newGitRepo(t)
 		t.Chdir(tmpDir)
-
-		// Initialize git repo
-		if err := runCommandInDir(tmpDir, "git", "init"); err != nil {
-			t.Fatalf("Failed to init git: %v", err)
-		}
 
 		role, hasRole := getBeadsRole()
 		if hasRole {
@@ -1092,13 +651,8 @@ func TestInitPromptRoleConfig(t *testing.T) {
 	})
 
 	t.Run("setBeadsRole and getBeadsRole roundtrip", func(t *testing.T) {
-		tmpDir := t.TempDir()
+		tmpDir := newGitRepo(t)
 		t.Chdir(tmpDir)
-
-		// Initialize git repo
-		if err := runCommandInDir(tmpDir, "git", "init"); err != nil {
-			t.Fatalf("Failed to init git: %v", err)
-		}
 
 		// Set role to contributor
 		if err := setBeadsRole("contributor"); err != nil {
@@ -1130,6 +684,7 @@ func TestInitPromptRoleConfig(t *testing.T) {
 
 // TestInitPromptSkippedWithFlags verifies that --contributor and --team flags skip the prompt
 func TestInitPromptSkippedWithFlags(t *testing.T) {
+	skipIfNoDolt(t)
 	t.Run("contributor flag skips prompt and runs wizard", func(t *testing.T) {
 		// Reset global state
 		origDBPath := dbPath
@@ -1147,13 +702,8 @@ func TestInitPromptSkippedWithFlags(t *testing.T) {
 		// Reset Cobra flags
 		initCmd.Flags().Set("contributor", "false")
 
-		tmpDir := t.TempDir()
+		tmpDir := newGitRepo(t)
 		t.Chdir(tmpDir)
-
-		// Initialize git repo
-		if err := runCommandInDir(tmpDir, "git", "init"); err != nil {
-			t.Fatalf("Failed to init git: %v", err)
-		}
 
 		// Verify no role is set initially
 		role, hasRole := getBeadsRole()
@@ -1188,13 +738,8 @@ func TestInitPromptSkippedWithFlags(t *testing.T) {
 		// Reset Cobra flags
 		initCmd.Flags().Set("team", "false")
 
-		tmpDir := t.TempDir()
+		tmpDir := newGitRepo(t)
 		t.Chdir(tmpDir)
-
-		// Initialize git repo
-		if err := runCommandInDir(tmpDir, "git", "init"); err != nil {
-			t.Fatalf("Failed to init git: %v", err)
-		}
 
 		// Verify no role is set initially
 		role, hasRole := getBeadsRole()
@@ -1232,6 +777,7 @@ func TestInitPromptTTYDetection(t *testing.T) {
 
 // TestInitPromptNonGitRepo verifies prompt is skipped in non-git directories
 func TestInitPromptNonGitRepo(t *testing.T) {
+	skipIfNoDolt(t)
 	// Reset global state
 	origDBPath := dbPath
 	defer func() { dbPath = origDBPath }()
@@ -1269,6 +815,7 @@ func TestInitPromptNonGitRepo(t *testing.T) {
 
 // TestInitPromptExistingRole verifies behavior when beads.role is already set
 func TestInitPromptExistingRole(t *testing.T) {
+	skipIfNoDolt(t)
 	t.Run("existing role is preserved on reinit with --force", func(t *testing.T) {
 		// Reset global state
 		origDBPath := dbPath
@@ -1288,13 +835,8 @@ func TestInitPromptExistingRole(t *testing.T) {
 		initCmd.Flags().Set("team", "false")
 		initCmd.Flags().Set("force", "false")
 
-		tmpDir := t.TempDir()
+		tmpDir := newGitRepo(t)
 		t.Chdir(tmpDir)
-
-		// Initialize git repo
-		if err := runCommandInDir(tmpDir, "git", "init"); err != nil {
-			t.Fatalf("Failed to init git: %v", err)
-		}
 
 		// Set role before init
 		if err := setBeadsRole("contributor"); err != nil {
@@ -1340,6 +882,7 @@ func TestInitPromptExistingRole(t *testing.T) {
 // not in the local .beads directory. (GH#bd-0qel)
 // TestInitRedirect groups redirect-related init tests.
 func TestInitRedirect(t *testing.T) {
+	skipIfNoDolt(t)
 	resetRedirectState := func(t *testing.T) {
 		t.Helper()
 		origDBPath := dbPath
@@ -1480,6 +1023,7 @@ func TestInitRedirect(t *testing.T) {
 // TestInitBEADS_DIR groups BEADS_DIR-related init tests.
 // Tests requirements FR-001, FR-002, FR-004, NFR-001.
 func TestInitBEADS_DIR(t *testing.T) {
+	skipIfNoDolt(t)
 	// resetBeadsDirState resets global state and env vars for each subtest.
 	resetBeadsDirState := func(t *testing.T) {
 		t.Helper()
@@ -1798,6 +1342,7 @@ func TestInit_WithBEADS_DIR_DoltBackend(t *testing.T) {
 // all 3 tracking metadata fields (bd_version, repo_id, clone_id) via verifyMetadata.
 // Covers FR-001, FR-002, FR-003, FR-004.
 func TestInitDoltMetadata(t *testing.T) {
+	skipIfNoDolt(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("Skipping Dolt metadata test on Windows")
 	}
@@ -1821,15 +1366,10 @@ func TestInitDoltMetadata(t *testing.T) {
 	initCmd.Flags().Set("quiet", "false")
 	initCmd.Flags().Set("backend", "")
 
-	tmpDir := t.TempDir()
+	tmpDir := newGitRepo(t)
 	t.Chdir(tmpDir)
 
-	// Create a git repo so ComputeRepoID succeeds (needs remote.origin.url)
-	if err := runCommandInDir(tmpDir, "git", "init"); err != nil {
-		t.Fatalf("git init failed: %v", err)
-	}
-	_ = runCommandInDir(tmpDir, "git", "config", "user.email", "test@example.com")
-	_ = runCommandInDir(tmpDir, "git", "config", "user.name", "Test User")
+	// Add remote.origin.url so ComputeRepoID succeeds
 	_ = runCommandInDir(tmpDir, "git", "config", "remote.origin.url", "https://github.com/test/repo.git")
 
 	rootCmd.SetArgs([]string{"init", "--prefix", "test", "--quiet"})
@@ -1889,6 +1429,7 @@ func openDoltStoreForTest(t *testing.T, ctx context.Context, doltPath, dbName st
 // verifyMetadata now takes *dolt.DoltStore (concrete type), making interface-based
 // mocking impossible. The failure paths are simple error-to-stderr logic.
 func TestVerifyMetadataSuccess(t *testing.T) {
+	skipIfNoDolt(t)
 	ctx := context.Background()
 
 	tmpDir := t.TempDir()
@@ -1915,6 +1456,7 @@ func TestVerifyMetadataSuccess(t *testing.T) {
 // Verifies warning output; actual metadata persistence checked by e2e tests.
 // Covers FR-015 (skip repo_id outside git).
 func TestInitDoltMetadataNoGit(t *testing.T) {
+	skipIfNoDolt(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("Skipping Dolt metadata test on Windows")
 	}
@@ -1937,11 +1479,12 @@ func TestInitDoltMetadataNoGit(t *testing.T) {
 	initCmd.Flags().Set("quiet", "false")
 	initCmd.Flags().Set("backend", "")
 
-	// Create temp dir WITHOUT git init — ComputeRepoID will fail
+	// Create temp dir WITHOUT git init — bd init will create one,
+	// but there will be no remote configured so upstream warning is expected.
 	tmpDir := t.TempDir()
 	t.Chdir(tmpDir)
 
-	// Capture stderr to check for repo_id warning
+	// Capture stderr to check for upstream warning
 	stderr := captureStderr(t, func() {
 		rootCmd.SetArgs([]string{"init", "--prefix", "nogit"})
 		if err := rootCmd.Execute(); err != nil {
@@ -1949,9 +1492,9 @@ func TestInitDoltMetadataNoGit(t *testing.T) {
 		}
 	})
 
-	// Should warn about repository ID (not in a git repo)
-	if !strings.Contains(stderr, "repository ID") {
-		t.Errorf("expected warning about repository ID in non-git dir, stderr: %s", stderr)
+	// Should warn about missing upstream (bd init creates git repo, but no remote)
+	if !strings.Contains(stderr, "upstream") && !strings.Contains(stderr, "repository ID") {
+		t.Errorf("expected warning about upstream or repository ID in non-git dir, stderr: %s", stderr)
 	}
 
 	// Verify .beads/dolt directory was created (init succeeded)

@@ -16,7 +16,7 @@ data between independent teams or locations. Key benefits:
 
 ## Prerequisites
 
-1. **Dolt backend**: Federation requires the Dolt storage backend (not SQLite)
+1. **Dolt backend**: Federation requires the Dolt storage backend
 2. **Sync mode**: Must use `dolt-native` or `belt-and-suspenders` sync mode
 
 ## Configuration
@@ -46,9 +46,8 @@ export BD_FEDERATION_SOVEREIGNTY="T2"
 
 | Mode | Description | Federation Support |
 |------|-------------|-------------------|
-| `git-portable` | JSONL export to git (default) | No |
-| `realtime` | JSONL on every change | No |
-| `dolt-native` | Dolt remotes only | Yes |
+| `dolt-native` | Dolt remotes (default) | Yes |
+| `git-portable` | Legacy JSONL export to git | No |
 | `belt-and-suspenders` | Dolt + JSONL backup | Yes |
 
 ### Data Sovereignty Tiers
@@ -153,8 +152,8 @@ as commands:
 
 ### "requires direct database access"
 
-Federation commands require the Dolt backend. Ensure you're not running in
-daemon mode for federation operations.
+Federation commands require the Dolt backend with direct database access. Ensure
+you have the Dolt backend configured for federation operations.
 
 ### "peer already exists"
 

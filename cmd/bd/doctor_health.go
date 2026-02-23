@@ -62,18 +62,8 @@ func runCheckHealth(path string) {
 		issues = append(issues, issue)
 	}
 
-	// Check 2: Sync branch not configured (now reads from config.yaml, not DB)
-	if issue := doctor.CheckSyncBranchQuick(); issue != "" {
-		issues = append(issues, issue)
-	}
-
-	// Check 3: Outdated git hooks
+	// Check 2: Outdated git hooks
 	if issue := doctor.CheckHooksQuick(Version); issue != "" {
-		issues = append(issues, issue)
-	}
-
-	// Check 3: Sync-branch hook compatibility (issue #532)
-	if issue := doctor.CheckSyncBranchHookQuick(path); issue != "" {
 		issues = append(issues, issue)
 	}
 
@@ -95,8 +85,7 @@ func runDeepValidation(path string) {
 	if jsonOutput {
 		jsonBytes, err := doctor.DeepValidationResultJSON(result)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			FatalError("%v", err)
 		}
 		fmt.Println(string(jsonBytes))
 	} else {
@@ -115,8 +104,7 @@ func runServerHealth(path string) {
 	if jsonOutput {
 		jsonBytes, err := json.Marshal(result)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to marshal health check result: %v\n", err)
-			os.Exit(1)
+			FatalError("failed to marshal health check result: %v", err)
 		}
 		fmt.Println(string(jsonBytes))
 	} else {

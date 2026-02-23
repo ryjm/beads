@@ -4,7 +4,6 @@ package doctor
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -12,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
@@ -21,7 +19,7 @@ import (
 func openStoreDB(beadsDir string) (*sql.DB, *dolt.DoltStore, error) {
 	ctx := context.Background()
 	doltPath := filepath.Join(beadsDir, "dolt")
-	store, err := dolt.New(ctx, &dolt.Config{Path: doltPath, ReadOnly: true})
+	store, err := dolt.New(ctx, &dolt.Config{Path: doltPath, ReadOnly: true, Database: doltDatabaseName(beadsDir)})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -142,12 +140,16 @@ func CheckOrphanedDependencies(path string) DoctorCheck {
 	}
 	defer func() { _ = store.Close() }()
 
-	// Query for orphaned dependencies
+	// Query for orphaned dependencies.
+	// Exclude external: refs — these are synthetic cross-rig tracking deps
+	// injected by the JSONL exporter and intentionally reference issues not
+	// present in the local database (#1593).
 	query := `
 		SELECT d.issue_id, d.depends_on_id, d.type
 		FROM dependencies d
 		LEFT JOIN issues i ON d.depends_on_id = i.id
 		WHERE i.id IS NULL
+		  AND d.depends_on_id NOT LIKE 'external:%'
 	`
 	rows, err := db.Query(query)
 	if err != nil {
@@ -323,6 +325,70 @@ func CheckTestPollution(path string) DoctorCheck {
 	}
 }
 
+// CheckGitConflicts detects unresolved git merge conflict markers in JSONL files.
+func CheckGitConflicts(path string) DoctorCheck {
+	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+
+	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
+		return DoctorCheck{
+			Name:    "Git Conflicts",
+			Status:  StatusOK,
+			Message: "N/A (no .beads directory)",
+		}
+	}
+
+	// Scan all JSONL files for conflict markers
+	matches, err := filepath.Glob(filepath.Join(beadsDir, "*.jsonl"))
+	if err != nil || len(matches) == 0 {
+		return DoctorCheck{
+			Name:    "Git Conflicts",
+			Status:  StatusOK,
+			Message: "No JSONL files to check",
+		}
+	}
+
+	var conflictFiles []string
+	for _, fpath := range matches {
+		f, err := os.Open(fpath) // #nosec G304 - path constructed from beadsDir
+		if err != nil {
+			continue
+		}
+		scanner := bufio.NewScanner(f)
+		hasConflict := false
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "<<<<<<<") || strings.HasPrefix(line, ">>>>>>>") || strings.HasPrefix(line, "=======") {
+				hasConflict = true
+				break
+			}
+		}
+		_ = f.Close()
+		if hasConflict {
+			if rel, err := filepath.Rel(beadsDir, fpath); err == nil {
+				conflictFiles = append(conflictFiles, rel)
+			} else {
+				conflictFiles = append(conflictFiles, filepath.Base(fpath))
+			}
+		}
+	}
+
+	if len(conflictFiles) == 0 {
+		return DoctorCheck{
+			Name:    "Git Conflicts",
+			Status:  StatusOK,
+			Message: "No conflict markers found",
+		}
+	}
+
+	return DoctorCheck{
+		Name:    "Git Conflicts",
+		Status:  StatusError,
+		Message: fmt.Sprintf("Unresolved git conflicts in %d file(s)", len(conflictFiles)),
+		Detail:  strings.Join(conflictFiles, ", "),
+		Fix:     "Resolve merge conflicts in .beads/ files, then commit",
+	}
+}
+
 // CheckChildParentDependencies detects child→parent blocking dependencies.
 // These often indicate a modeling mistake (deadlock: child waits for parent, parent waits for children).
 // However, they may be intentional in some workflows, so removal requires explicit opt-in.
@@ -388,130 +454,5 @@ func CheckChildParentDependencies(path string) DoctorCheck {
 		Detail:   detail,
 		Fix:      "Run 'bd doctor --fix --fix-child-parent' to remove (if unintentional)",
 		Category: CategoryMetadata,
-	}
-}
-
-// CheckRedirectSyncBranchConflict detects when both redirect and sync-branch are configured.
-// This is a configuration error: redirect means "my database is elsewhere (I'm a client)",
-// while sync-branch means "I own my database and sync it myself". These are mutually exclusive.
-// bd-wayc3: Added to detect incompatible configuration before sync fails.
-func CheckRedirectSyncBranchConflict(path string) DoctorCheck {
-	beadsDir := filepath.Join(path, ".beads")
-
-	// Check if redirect file exists
-	redirectFile := filepath.Join(beadsDir, beads.RedirectFileName)
-	if _, err := os.Stat(redirectFile); os.IsNotExist(err) {
-		return DoctorCheck{
-			Name:     "Redirect + Sync-Branch",
-			Status:   StatusOK,
-			Message:  "No redirect configured",
-			Category: CategoryData,
-		}
-	}
-
-	// Redirect exists - check if sync-branch is also configured
-	// Read config.yaml directly since we need to check the local config, not the resolved one
-	configPath := filepath.Join(beadsDir, "config.yaml")
-	data, err := os.ReadFile(configPath) // #nosec G304 - path constructed safely
-	if err != nil {
-		// No config file - no conflict possible
-		return DoctorCheck{
-			Name:     "Redirect + Sync-Branch",
-			Status:   StatusOK,
-			Message:  "Redirect active (no local config)",
-			Category: CategoryData,
-		}
-	}
-
-	// Parse sync-branch from config.yaml (simple line-based parsing)
-	// Handles: sync-branch: value, sync-branch: "value", sync-branch: 'value'
-	// Also handles trailing comments: sync-branch: value # comment
-	configStr := string(data)
-	for _, line := range strings.Split(configStr, "\n") {
-		line = strings.TrimSpace(line)
-		// Skip comments
-		if strings.HasPrefix(line, "#") {
-			continue
-		}
-		if strings.HasPrefix(line, "sync-branch:") {
-			value := strings.TrimPrefix(line, "sync-branch:")
-			// Remove trailing comment if present
-			if idx := strings.Index(value, "#"); idx != -1 {
-				value = value[:idx]
-			}
-			value = strings.TrimSpace(value)
-			// Remove quotes if present
-			value = strings.Trim(value, `"'`)
-			if value != "" {
-				// Found both redirect and sync-branch - conflict!
-				return DoctorCheck{
-					Name:     "Redirect + Sync-Branch",
-					Status:   StatusWarning,
-					Message:  fmt.Sprintf("Redirect active but sync-branch=%q configured", value),
-					Detail:   "Redirect and sync-branch are mutually exclusive. Redirected clones should not have sync-branch.",
-					Fix:      "Remove sync-branch from config.yaml (set to empty string or delete the line)",
-					Category: CategoryData,
-				}
-			}
-		}
-	}
-
-	return DoctorCheck{
-		Name:     "Redirect + Sync-Branch",
-		Status:   StatusOK,
-		Message:  "Redirect active (no sync-branch conflict)",
-		Category: CategoryData,
-	}
-}
-
-// CheckGitConflicts detects git conflict markers in JSONL file.
-func CheckGitConflicts(path string) DoctorCheck {
-	// Follow redirect to resolve actual beads directory (bd-tvus fix)
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
-	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-
-	if _, err := os.Stat(jsonlPath); os.IsNotExist(err) {
-		return DoctorCheck{
-			Name:    "Git Conflicts",
-			Status:  "ok",
-			Message: "N/A (no JSONL file)",
-		}
-	}
-
-	data, err := os.ReadFile(jsonlPath) // #nosec G304 - path constructed safely
-	if err != nil {
-		return DoctorCheck{
-			Name:    "Git Conflicts",
-			Status:  "ok",
-			Message: "N/A (unable to read JSONL)",
-		}
-	}
-
-	// Look for conflict markers at start of lines
-	lines := bytes.Split(data, []byte("\n"))
-	var conflictLines []int
-	for i, line := range lines {
-		trimmed := bytes.TrimSpace(line)
-		if bytes.HasPrefix(trimmed, []byte("<<<<<<< ")) ||
-			bytes.Equal(trimmed, []byte("=======")) ||
-			bytes.HasPrefix(trimmed, []byte(">>>>>>> ")) {
-			conflictLines = append(conflictLines, i+1)
-		}
-	}
-
-	if len(conflictLines) == 0 {
-		return DoctorCheck{
-			Name:    "Git Conflicts",
-			Status:  "ok",
-			Message: "No git conflicts in JSONL",
-		}
-	}
-
-	return DoctorCheck{
-		Name:    "Git Conflicts",
-		Status:  "error",
-		Message: fmt.Sprintf("Git conflict markers found at %d location(s)", len(conflictLines)),
-		Detail:  fmt.Sprintf("Conflict markers at lines: %v", conflictLines),
-		Fix:     "Resolve conflicts manually: git checkout --ours or --theirs .beads/issues.jsonl",
 	}
 }

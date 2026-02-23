@@ -5,10 +5,12 @@ package tracker
 import (
 	"context"
 	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -16,6 +18,9 @@ import (
 // newTestStore creates a dolt store for engine tests with issue_prefix configured
 func newTestStore(t *testing.T) *dolt.DoltStore {
 	t.Helper()
+	if _, err := exec.LookPath("dolt"); err != nil {
+		t.Skip("Dolt not installed, skipping test")
+	}
 	ctx := context.Background()
 	store, err := dolt.New(ctx, &dolt.Config{Path: t.TempDir()})
 	if err != nil {
@@ -52,7 +57,7 @@ func newMockTracker(name string) *mockTracker {
 func (m *mockTracker) Name() string                                    { return m.name }
 func (m *mockTracker) DisplayName() string                             { return m.name }
 func (m *mockTracker) ConfigPrefix() string                            { return m.name }
-func (m *mockTracker) Init(_ context.Context, _ *dolt.DoltStore) error { return nil }
+func (m *mockTracker) Init(_ context.Context, _ storage.Storage) error { return nil }
 func (m *mockTracker) Validate() error                                 { return nil }
 func (m *mockTracker) Close() error                                    { return nil }
 func (m *mockTracker) FieldMapper() FieldMapper                        { return m.fieldMapper }

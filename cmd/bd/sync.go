@@ -1,29 +1,23 @@
 package main
 
 import (
+	"fmt"
+
 	"github.com/spf13/cobra"
 )
 
-// syncCmd is a no-op kept for backward compatibility.
-// Models and scripts have "bd sync" in muscle memory from the JSONL era.
-// With Dolt-native storage, writes are persisted immediately — there is nothing to sync.
+// syncCmd is a deprecated no-op that directs users to bd dolt push/pull.
 var syncCmd = &cobra.Command{
 	Use:     "sync",
 	GroupID: "sync",
-	Short:   "No-op (Dolt persists writes immediately)",
-	Long: `With Dolt-native storage, all writes are persisted immediately.
-There is nothing to sync. This command exists for backward compatibility
-and returns instantly.
+	Short:   "Deprecated: use 'bd dolt push' and 'bd dolt pull' instead",
+	Long: `bd sync is deprecated and is now a no-op.
 
-For Dolt remote operations, use:
+Use Dolt remote commands directly:
   bd dolt push     Push to Dolt remote
-  bd dolt pull     Pull from Dolt remote
-
-For data interchange:
-  bd export        Export database to JSONL
-  bd import        Import JSONL into database`,
+  bd dolt pull     Pull from Dolt remote`,
 	Run: func(_ *cobra.Command, _ []string) {
-		// Silent no-op. Dolt persists writes immediately.
+		fmt.Println("bd sync is deprecated. Use 'bd dolt push' and 'bd dolt pull' instead.")
 	},
 }
 

@@ -1,20 +1,18 @@
 package doctor
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
-	_ "github.com/ncruces/go-sqlite3/driver"
-	_ "github.com/ncruces/go-sqlite3/embed"
 	"github.com/spf13/viper"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
 // validRoutingModes are the allowed values for routing.mode
@@ -89,25 +87,6 @@ func findConfigPath(repoPath string) string {
 		}
 	}
 	return ""
-}
-
-// validateDurationConfig validates a duration config value.
-func validateDurationConfig(v *viper.Viper, key string, minDuration time.Duration) []string {
-	if !v.IsSet(key) {
-		return nil
-	}
-	durStr := v.GetString(key)
-	if durStr == "" {
-		return nil
-	}
-	d, err := time.ParseDuration(durStr)
-	if err != nil {
-		return []string{fmt.Sprintf("%s: invalid duration %q (expected format like \"30s\", \"1m\", \"500ms\")", key, durStr)}
-	}
-	if minDuration > 0 && d > 0 && d < minDuration {
-		return []string{fmt.Sprintf("%s: %q is too low (minimum %s)", key, durStr, minDuration)}
-	}
-	return nil
 }
 
 // validateBooleanConfigs validates boolean config values.
@@ -187,10 +166,6 @@ func checkYAMLConfigValues(repoPath string) []string {
 		return issues
 	}
 
-	// Validate duration configs
-	issues = append(issues, validateDurationConfig(v, "flush-debounce", 0)...)
-	issues = append(issues, validateDurationConfig(v, "remote-sync-interval", 5*time.Second)...)
-
 	// Validate issue-prefix (should be alphanumeric with dashes/underscores, reasonably short)
 	if v.IsSet("issue-prefix") {
 		prefix := v.GetString("issue-prefix")
@@ -262,16 +237,6 @@ func checkYAMLConfigValues(repoPath string) []string {
 						}
 					}
 				}
-			}
-		}
-	}
-
-	// Validate sync-branch (should be a valid git branch name if set)
-	if v.IsSet("sync-branch") {
-		branch := v.GetString("sync-branch")
-		if branch != "" {
-			if !isValidBranchName(branch) {
-				issues = append(issues, fmt.Sprintf("sync-branch: %q is not a valid git branch name", branch))
 			}
 		}
 	}
@@ -363,20 +328,6 @@ func checkMetadataConfigValues(repoPath string) []string {
 		}
 	}
 
-	// Validate jsonl_export filename
-	if cfg.JSONLExport != "" {
-		switch cfg.JSONLExport {
-		case "deletions.jsonl", "interactions.jsonl", "molecules.jsonl":
-			issues = append(issues, fmt.Sprintf("metadata.json jsonl_export: %q is a system file and should not be configured as a JSONL export (expected issues.jsonl)", cfg.JSONLExport))
-		}
-		if strings.Contains(cfg.JSONLExport, string(os.PathSeparator)) || strings.Contains(cfg.JSONLExport, "/") {
-			issues = append(issues, fmt.Sprintf("metadata.json jsonl_export: %q should be a filename, not a path", cfg.JSONLExport))
-		}
-		if !strings.HasSuffix(cfg.JSONLExport, ".jsonl") {
-			issues = append(issues, fmt.Sprintf("metadata.json jsonl_export: %q should have .jsonl extension", cfg.JSONLExport))
-		}
-	}
-
 	// Validate deletions_retention_days
 	if cfg.DeletionsRetentionDays < 0 {
 		issues = append(issues, fmt.Sprintf("metadata.json deletions_retention_days: %d is invalid (must be >= 0)", cfg.DeletionsRetentionDays))
@@ -394,32 +345,37 @@ func checkDatabaseConfigValues(repoPath string) []string {
 		return issues // No .beads directory, nothing to check
 	}
 
-	// Get database path (backend-aware)
-	dbPath := filepath.Join(beadsDir, beads.CanonicalDatabaseName)
-	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil {
-		// For Dolt, cfg.DatabasePath() is a directory and sqlite checks are not applicable.
-		if cfg.GetBackend() == configfile.BackendDolt {
-			return issues
-		}
-		if cfg.Database != "" {
-			dbPath = cfg.DatabasePath(beadsDir)
-		}
+	// Check backend
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil {
+		return issues
 	}
 
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	backend := configfile.BackendDolt
+	if cfg != nil {
+		backend = cfg.GetBackend()
+	}
+
+	if backend != configfile.BackendDolt {
+		return issues // Non-Dolt backend, skip database config validation
+	}
+
+	// Check if Dolt directory exists
+	doltPath := filepath.Join(beadsDir, "dolt")
+	if _, err := os.Stat(doltPath); os.IsNotExist(err) {
 		return issues // No database, nothing to check
 	}
 
-	// Open database in read-only mode
-	db, err := sql.Open("sqlite3", sqliteConnString(dbPath, true))
+	// Open Dolt store in read-only mode
+	ctx := context.Background()
+	store, err := dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
 	if err != nil {
 		return issues // Can't open database, skip
 	}
-	defer db.Close()
+	defer func() { _ = store.Close() }()
 
 	// Check status.custom - custom status names should be lowercase alphanumeric with underscores
-	var statusCustom string
-	err = db.QueryRow("SELECT value FROM config WHERE key = 'status.custom'").Scan(&statusCustom)
+	statusCustom, err := store.GetConfig(ctx, "status.custom")
 	if err == nil && statusCustom != "" {
 		statuses := strings.Split(statusCustom, ",")
 		for _, status := range statuses {
@@ -435,15 +391,6 @@ func checkDatabaseConfigValues(repoPath string) []string {
 			case "open", "in_progress", "blocked", "closed":
 				issues = append(issues, fmt.Sprintf("status.custom: %q conflicts with built-in status", status))
 			}
-		}
-	}
-
-	// Check sync.branch if stored in database (legacy location)
-	var syncBranch string
-	err = db.QueryRow("SELECT value FROM config WHERE key = 'sync.branch'").Scan(&syncBranch)
-	if err == nil && syncBranch != "" {
-		if !isValidBranchName(syncBranch) {
-			issues = append(issues, fmt.Sprintf("sync.branch (database): %q is not a valid git branch name", syncBranch))
 		}
 	}
 

@@ -21,51 +21,9 @@ func TestCheckClassicArtifacts_NoArtifacts(t *testing.T) {
 	}
 }
 
+// TestScanForArtifacts_JSONLInDoltDir — JSONL artifact scanning removed (bd-9ni.2)
 func TestScanForArtifacts_JSONLInDoltDir(t *testing.T) {
-	dir := t.TempDir()
-
-	// Create a .beads directory with dolt/ and stale JSONL files
-	beadsDir := filepath.Join(dir, ".beads")
-	doltDir := filepath.Join(beadsDir, "dolt")
-	if err := os.MkdirAll(doltDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create JSONL artifacts
-	for _, name := range []string{"issues.jsonl", "issues.jsonl.new", "beads.left.jsonl"} {
-		if err := os.WriteFile(filepath.Join(beadsDir, name), []byte(`{"id":"test"}`), 0644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// Create empty interactions.jsonl (should be skipped as harmless)
-	if err := os.WriteFile(filepath.Join(beadsDir, "interactions.jsonl"), []byte{}, 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	report := ScanForArtifacts(dir)
-
-	// issues.jsonl, issues.jsonl.new, beads.left.jsonl should be found
-	// interactions.jsonl (empty) should be skipped
-	if len(report.JSONLArtifacts) != 3 {
-		t.Errorf("expected 3 JSONL artifacts, got %d", len(report.JSONLArtifacts))
-		for _, f := range report.JSONLArtifacts {
-			t.Logf("  found: %s", f.Path)
-		}
-	}
-
-	// issues.jsonl should NOT be safe to delete
-	for _, f := range report.JSONLArtifacts {
-		if filepath.Base(f.Path) == "issues.jsonl" && f.SafeDelete {
-			t.Error("issues.jsonl should NOT be safe to delete")
-		}
-	}
-
-	// issues.jsonl.new should be safe to delete
-	for _, f := range report.JSONLArtifacts {
-		if filepath.Base(f.Path) == "issues.jsonl.new" && !f.SafeDelete {
-			t.Error("issues.jsonl.new should be safe to delete")
-		}
-	}
+	t.Skip("JSONL artifact scanning removed as part of JSONL removal (bd-9ni.2)")
 }
 
 func TestScanForArtifacts_SQLiteFiles(t *testing.T) {
@@ -73,6 +31,12 @@ func TestScanForArtifacts_SQLiteFiles(t *testing.T) {
 
 	beadsDir := filepath.Join(dir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create dolt/ directory so isDoltNative returns true (SQLite files
+	// are only flagged as artifacts when Dolt is the active backend)
+	if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -303,30 +267,20 @@ func TestScanForArtifacts_SkipsGitkeep(t *testing.T) {
 	}
 }
 
+// TestScanForArtifacts_NonEmptyInteractionsJSONL — JSONL artifact scanning removed (bd-9ni.2)
 func TestScanForArtifacts_NonEmptyInteractionsJSONL(t *testing.T) {
-	dir := t.TempDir()
-	beadsDir := filepath.Join(dir, ".beads")
-	doltDir := filepath.Join(beadsDir, "dolt")
-	if err := os.MkdirAll(doltDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Non-empty interactions.jsonl should be detected
-	if err := os.WriteFile(filepath.Join(beadsDir, "interactions.jsonl"), []byte(`{"id":"test"}`), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	report := ScanForArtifacts(dir)
-
-	if len(report.JSONLArtifacts) != 1 {
-		t.Errorf("expected 1 JSONL artifact (non-empty interactions), got %d", len(report.JSONLArtifacts))
-	}
+	t.Skip("JSONL artifact scanning removed as part of JSONL removal (bd-9ni.2)")
 }
 
 func TestCheckClassicArtifacts_WithArtifacts(t *testing.T) {
 	dir := t.TempDir()
 	beadsDir := filepath.Join(dir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create dolt/ directory so isDoltNative returns true
+	if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0755); err != nil {
 		t.Fatal(err)
 	}
 

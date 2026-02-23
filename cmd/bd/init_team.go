@@ -9,7 +9,6 @@ import (
 
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/storage/dolt"
-	"github.com/steveyegge/beads/internal/syncbranch"
 	"github.com/steveyegge/beads/internal/ui"
 )
 
@@ -87,8 +86,7 @@ func runTeamWizard(ctx context.Context, store *dolt.DoltStore) error {
 
 		fmt.Printf("\n%s Sync branch set to: %s\n", ui.RenderPass("✓"), syncBranch)
 
-		// Set sync.branch config (GH#923: use syncbranch.Set for validation)
-		if err := syncbranch.Set(ctx, store, syncBranch); err != nil {
+		if err := store.SetConfig(ctx, "sync.branch", syncBranch); err != nil {
 			return fmt.Errorf("failed to set sync branch: %w", err)
 		}
 
@@ -147,7 +145,7 @@ func runTeamWizard(ctx context.Context, store *dolt.DoltStore) error {
 		fmt.Println("  • Periodically merge", syncBranch, "to main via PR")
 	}
 
-	fmt.Println("  • Dolt handles sync natively — run 'bd sync' to sync changes")
+	fmt.Println("  • Dolt handles sync natively — run 'bd dolt push' to push changes")
 	fmt.Println()
 	fmt.Printf("Try it: %s\n", ui.RenderAccent("bd create \"Team planning issue\" -p 2"))
 	fmt.Println()

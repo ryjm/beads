@@ -11,6 +11,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/cmd/bd/doctor"
+	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/ui"
 )
 
@@ -47,8 +49,6 @@ var (
 	doctorOutput               string // export diagnostics to file
 	doctorFixChildParent       bool   // opt-in fix for child→parent deps
 	doctorVerbose              bool   // show detailed output during fixes
-	doctorForce                bool   // force repair mode, bypass validation where safe
-	doctorSource               string // source of truth selection: auto, jsonl, db
 	perfMode                   bool
 	checkHealthMode            bool
 	doctorCheckFlag            string // run specific check (e.g., "pollution")
@@ -62,9 +62,6 @@ var (
 
 // ConfigKeyHintsDoctor is the config key for suppressing doctor hints
 const ConfigKeyHintsDoctor = "hints.doctor"
-
-// minSyncBranchHookVersion is the minimum hook version that supports sync-branch bypass (issue #532)
-const minSyncBranchHookVersion = "0.29.0"
 
 var doctorCmd = &cobra.Command{
 	Use:     "doctor [path]",
@@ -177,8 +174,7 @@ Examples:
 		// Convert to absolute path
 		absPath, err := filepath.Abs(checkPath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to resolve path: %v\n", err)
-			os.Exit(1)
+			FatalError("failed to resolve path: %v", err)
 		}
 
 		// Run performance diagnostics if --perf flag is set
@@ -206,9 +202,7 @@ Examples:
 				runArtifactsCheck(absPath, doctorClean, doctorYes)
 				return
 			default:
-				fmt.Fprintf(os.Stderr, "Error: unknown check %q\n", doctorCheckFlag)
-				fmt.Fprintf(os.Stderr, "Available checks: artifacts, pollution, validate\n")
-				os.Exit(1)
+				FatalErrorWithHint(fmt.Sprintf("unknown check %q", doctorCheckFlag), "Available checks: artifacts, pollution, validate")
 			}
 		}
 
@@ -237,9 +231,14 @@ Examples:
 		if doctorDryRun {
 			previewFixes(result)
 		} else if doctorFix {
+			// Release any Dolt locks left by diagnostics before applying fixes.
+			releaseDiagnosticLocks(absPath)
 			applyFixes(result)
-			// Re-run diagnostics to show results
-			result = runDiagnostics(absPath)
+			// Note: we intentionally do NOT re-run diagnostics here.
+			// If any Close() timed out during the first diagnostic pass,
+			// leaked goroutines may hold internal noms locks and a second
+			// open could deadlock. Users should run 'bd doctor' again to verify fixes.
+			fmt.Println("\nRun 'bd doctor' again to verify fixes.")
 		}
 
 		// Add timestamp and platform info for export
@@ -251,8 +250,7 @@ Examples:
 		// Export to file if --output specified
 		if doctorOutput != "" {
 			if err := exportDiagnostics(result, doctorOutput); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: failed to export diagnostics: %v\n", err)
-				os.Exit(1)
+				FatalError("failed to export diagnostics: %v", err)
 			}
 			fmt.Printf("✓ Diagnostics exported to %s\n", doctorOutput)
 		}
@@ -279,12 +277,43 @@ func init() {
 	doctorCmd.Flags().BoolVar(&doctorDryRun, "dry-run", false, "Preview fixes without making changes")
 	doctorCmd.Flags().BoolVar(&doctorFixChildParent, "fix-child-parent", false, "Remove child→parent dependencies (opt-in)")
 	doctorCmd.Flags().BoolVarP(&doctorVerbose, "verbose", "v", false, "Show all checks (default shows only warnings/errors)")
-	doctorCmd.Flags().BoolVar(&doctorForce, "force", false, "Force repair mode: attempt recovery even when database cannot be opened")
-	doctorCmd.Flags().StringVar(&doctorSource, "source", "auto", "Choose source of truth for recovery: auto (detect), jsonl (prefer JSONL), db (prefer database)")
 	doctorCmd.Flags().BoolVar(&doctorGastown, "gastown", false, "Running in gastown multi-workspace mode (routes.jsonl is expected, higher duplicate tolerance)")
 	doctorCmd.Flags().IntVar(&gastownDuplicatesThreshold, "gastown-duplicates-threshold", 1000, "Duplicate tolerance threshold for gastown mode (wisps are ephemeral)")
 	doctorCmd.Flags().BoolVar(&doctorServer, "server", false, "Run Dolt server mode health checks (connectivity, version, schema)")
 	doctorCmd.Flags().StringVar(&doctorMigration, "migration", "", "Run Dolt migration validation: 'pre' (before migration) or 'post' (after migration)")
+}
+
+// releaseDiagnosticLocks removes stale noms LOCK files that the diagnostics
+// phase may have left behind. CloseWithTimeout can leave goroutines (and
+// their LOCK files) behind when it times out.
+func releaseDiagnosticLocks(path string) {
+	beadsDir := filepath.Join(path, ".beads")
+	beadsDir = beads.FollowRedirect(beadsDir)
+
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil || cfg == nil {
+		return // Can't determine config, skip cleanup
+	}
+
+	// Only clean up for Dolt backend.
+	if cfg.GetBackend() != configfile.BackendDolt {
+		return
+	}
+
+	doltPath := cfg.DatabasePath(beadsDir)
+	entries, err := os.ReadDir(doltPath)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		nomsLock := filepath.Join(doltPath, entry.Name(), ".dolt", "noms", "LOCK")
+		if _, err := os.Stat(nomsLock); err == nil {
+			_ = os.Remove(nomsLock)
+		}
+	}
 }
 
 func runDiagnostics(path string) doctorResult {
@@ -314,13 +343,6 @@ func runDiagnostics(path string) doctorResult {
 	result.Checks = append(result.Checks, hooksCheck)
 	// Don't fail overall check for missing hooks, just warn
 
-	// Check sync-branch hook compatibility (issue #532)
-	syncBranchHookCheck := convertWithCategory(doctor.CheckSyncBranchHookCompatibility(path), doctor.CategoryGit)
-	result.Checks = append(result.Checks, syncBranchHookCheck)
-	if syncBranchHookCheck.Status == statusError {
-		result.OverallOK = false
-	}
-
 	// Check git hooks Dolt compatibility (hooks without Dolt check cause errors)
 	doltHooksCheck := convertWithCategory(doctor.CheckGitHooksDoltCompatibility(path), doctor.CategoryGit)
 	result.Checks = append(result.Checks, doltHooksCheck)
@@ -340,6 +362,12 @@ func runDiagnostics(path string) doctorResult {
 	if freshCloneCheck.Status == statusWarning || freshCloneCheck.Status == statusError {
 		result.OverallOK = false
 	}
+
+	// GH#1981: Run lock health check BEFORE any checks that open embedded
+	// Dolt databases. Earlier checks (CheckDatabaseVersion, CheckSchemaCompatibility,
+	// etc.) create noms LOCK files via flock(); if CheckLockHealth runs after them,
+	// it detects those same-process locks as "held by another process" (false positive).
+	earlyLockCheck := doctor.CheckLockHealth(path)
 
 	// Check 2: Database version
 	dbCheck := convertWithCategory(doctor.CheckDatabaseVersion(path, Version), doctor.CategoryCore)
@@ -368,11 +396,6 @@ func runDiagnostics(path string) doctorResult {
 	if integrityCheck.Status == statusError {
 		result.OverallOK = false
 	}
-
-	// Check 2d: Backend migration (SQLite + prefer-dolt → recommend Dolt)
-	backendMigrationCheck := convertDoctorCheck(doctor.CheckBackendMigration(path))
-	result.Checks = append(result.Checks, backendMigrationCheck)
-	// Don't fail overall check for backend migration, just warn
 
 	// Check 3: ID format (hash vs sequential)
 	idCheck := convertWithCategory(doctor.CheckIDFormat(path), doctor.CategoryCore)
@@ -413,18 +436,18 @@ func runDiagnostics(path string) doctorResult {
 	result.Checks = append(result.Checks, roleCheck)
 	// Don't fail overall check for role config, just warn - URL heuristic fallback still works
 
-	// Check 7d: JSONL integrity (malformed lines, missing IDs)
-	jsonlIntegrityCheck := convertWithCategory(doctor.CheckJSONLIntegrity(path), doctor.CategoryData)
-	result.Checks = append(result.Checks, jsonlIntegrityCheck)
-	if jsonlIntegrityCheck.Status == statusWarning || jsonlIntegrityCheck.Status == statusError {
-		result.OverallOK = false
-	}
-
 	// Check 7e: Stale lock files (bootstrap, sync, daemon, startup)
 	staleLockCheck := convertDoctorCheck(doctor.CheckStaleLockFiles(path))
 	result.Checks = append(result.Checks, staleLockCheck)
 	if staleLockCheck.Status == statusWarning || staleLockCheck.Status == statusError {
 		result.OverallOK = false
+	}
+
+	// Dolt health checks (connection, schema, issue count, status).
+	// GH#1981: Pass the pre-computed lock check (run before any embedded Dolt
+	// opens) to avoid false positives from doctor's own noms LOCK files.
+	for _, dc := range doctor.RunDoltHealthChecksWithLock(path, earlyLockCheck) {
+		result.Checks = append(result.Checks, convertDoctorCheck(dc))
 	}
 
 	// Federation health checks (bd-wkumz.6)
@@ -448,17 +471,9 @@ func runDiagnostics(path string) doctorResult {
 		result.OverallOK = false // Unresolved conflicts are a real problem
 	}
 
-	// Check 8h: Dolt init vs embedded mode mismatch
+	// Check 8h: Dolt server mode configuration check
 	doltModeCheck := convertWithCategory(doctor.CheckDoltServerModeMismatch(path), doctor.CategoryFederation)
 	result.Checks = append(result.Checks, doltModeCheck)
-
-	// Check 9a: Sync divergence (JSONL/SQLite/git) - GH#885
-	syncDivergenceCheck := convertWithCategory(doctor.CheckSyncDivergence(path), doctor.CategoryData)
-	result.Checks = append(result.Checks, syncDivergenceCheck)
-	if syncDivergenceCheck.Status == statusError {
-		result.OverallOK = false
-	}
-	// Warning-level divergence is informational, doesn't fail overall
 
 	// Check 9: Permissions
 	permCheck := convertWithCategory(doctor.CheckPermissions(path), doctor.CategoryCore)
@@ -526,10 +541,10 @@ func runDiagnostics(path string) doctorResult {
 	result.Checks = append(result.Checks, gitignoreCheck)
 	// Don't fail overall check for gitignore, just warn
 
-	// Check 14a: issues.jsonl tracking (catches global gitignore conflicts)
-	issuesTrackingCheck := convertWithCategory(doctor.CheckIssuesTracking(), doctor.CategoryGit)
-	result.Checks = append(result.Checks, issuesTrackingCheck)
-	// Don't fail overall check for tracking issues, just warn
+	// Check 14a: Project-root .gitignore has Dolt exclusion patterns (GH#2034)
+	projectGitignoreCheck := convertWithCategory(doctor.CheckProjectGitignore(), doctor.CategoryGit)
+	result.Checks = append(result.Checks, projectGitignoreCheck)
+	// Don't fail overall check for project gitignore, just warn
 
 	// Check 14b: redirect file tracking (worktree redirect files shouldn't be committed)
 	redirectTrackingCheck := convertWithCategory(doctor.CheckRedirectNotTracked(), doctor.CategoryGit)
@@ -551,20 +566,10 @@ func runDiagnostics(path string) doctorResult {
 	result.Checks = append(result.Checks, vestigialWorktreesCheck)
 	// Don't fail overall check for vestigial worktrees, just warn
 
-	// Check 14f: redirect + sync-branch conflict (bd-wayc3)
-	redirectSyncBranchCheck := convertDoctorCheck(doctor.CheckRedirectSyncBranchConflict(path))
-	result.Checks = append(result.Checks, redirectSyncBranchCheck)
-	// Don't fail overall check for redirect+sync-branch conflict, just warn
-
 	// Check 14g: last-touched file tracking (runtime state shouldn't be committed)
 	lastTouchedTrackingCheck := convertWithCategory(doctor.CheckLastTouchedNotTracked(), doctor.CategoryGit)
 	result.Checks = append(result.Checks, lastTouchedTrackingCheck)
 	// Don't fail overall check for last-touched tracking, just warn
-
-	// Check 15: Git merge driver configuration
-	mergeDriverCheck := convertWithCategory(doctor.CheckMergeDriver(path), doctor.CategoryGit)
-	result.Checks = append(result.Checks, mergeDriverCheck)
-	// Don't fail overall check for merge driver, just warn
 
 	// Check 15a: Git working tree cleanliness (AGENTS.md hygiene)
 	gitWorkingTreeCheck := convertWithCategory(doctor.CheckGitWorkingTree(path), doctor.CategoryGit)
@@ -581,25 +586,10 @@ func runDiagnostics(path string) doctorResult {
 	result.Checks = append(result.Checks, metadataCheck)
 	// Don't fail overall check for metadata, just warn
 
-	// Check 17: Sync branch configuration
-	syncBranchCheck := convertWithCategory(doctor.CheckSyncBranchConfig(path), doctor.CategoryGit)
-	result.Checks = append(result.Checks, syncBranchCheck)
-	// Don't fail overall check for missing sync.branch, just warn
-
-	// Check 17a: Sync branch health
-	syncBranchHealthCheck := convertWithCategory(doctor.CheckSyncBranchHealth(path), doctor.CategoryGit)
-	result.Checks = append(result.Checks, syncBranchHealthCheck)
-	// Don't fail overall check for sync branch health, just warn
-
 	// Check 17b: Orphaned issues - referenced in commits but still open
 	orphanedIssuesCheck := convertWithCategory(doctor.CheckOrphanedIssues(path), doctor.CategoryGit)
 	result.Checks = append(result.Checks, orphanedIssuesCheck)
 	// Don't fail overall check for orphaned issues, just warn
-
-	// Check 17c: Sync branch gitignore flags (GH#870)
-	syncBranchGitignoreCheck := convertWithCategory(doctor.CheckSyncBranchGitignore(), doctor.CategoryGit)
-	result.Checks = append(result.Checks, syncBranchGitignoreCheck)
-	// Don't fail overall check for sync branch gitignore, just warn
 
 	// Check 18: Deletions manifest (legacy)
 	deletionsCheck := convertWithCategory(doctor.CheckDeletionsManifest(path), doctor.CategoryMetadata)
@@ -635,13 +625,6 @@ func runDiagnostics(path string) doctorResult {
 	pollutionCheck := convertDoctorCheck(doctor.CheckTestPollution(path))
 	result.Checks = append(result.Checks, pollutionCheck)
 	// Don't fail overall check for test pollution, just warn
-
-	// Check 25: Git conflicts in JSONL (from bd validate)
-	conflictsCheck := convertDoctorCheck(doctor.CheckGitConflicts(path))
-	result.Checks = append(result.Checks, conflictsCheck)
-	if conflictsCheck.Status == statusError {
-		result.OverallOK = false
-	}
 
 	// Check 26: Stale closed issues (maintenance)
 	staleClosedCheck := convertDoctorCheck(doctor.CheckStaleClosedIssues(path))
@@ -688,11 +671,6 @@ func runDiagnostics(path string) doctorResult {
 	kvSyncCheck := convertDoctorCheck(doctor.CheckKVSyncStatus(path))
 	result.Checks = append(result.Checks, kvSyncCheck)
 	// Don't fail overall check for KV sync warning, just inform
-
-	// Dolt health checks (connection, schema, sync, status via AccessLock)
-	for _, dc := range doctor.RunDoltHealthChecks(path) {
-		result.Checks = append(result.Checks, convertDoctorCheck(dc))
-	}
 
 	// Check 32: Dolt locks (uncommitted changes)
 	doltLocksCheck := convertDoctorCheck(doctor.CheckDoltLocks(path))
@@ -1020,8 +998,7 @@ func runMigrationValidation(path string, phase string) {
 		check = convertDoctorCheck(dc)
 		result = mr
 	default:
-		fmt.Fprintf(os.Stderr, "Error: invalid migration phase %q (use 'pre' or 'post')\n", phase)
-		os.Exit(1)
+		FatalError("invalid migration phase %q (use 'pre' or 'post')", phase)
 	}
 
 	// JSON output for machine consumption
